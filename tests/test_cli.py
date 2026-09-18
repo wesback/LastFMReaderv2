@@ -93,6 +93,22 @@ timezone = "UTC"
         transport.assert_not_called()
         writer.assert_not_called()
 
+    def test_parquet_file_uri_is_valid_under_dry_run(self) -> None:
+        path = self.write_config(
+            self.valid_config().replace(
+                'destination = "file:///exports"',
+                'destination = "file:///tmp/x"',
+            )
+        )
+
+        self.assertEqual(
+            main(
+                ["--config", str(path), "--dry-run"],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+            ),
+            0,
+        )
+
     def test_invalid_configuration_returns_error_without_secret_value(self) -> None:
         path = self.write_config(self.valid_config().replace("format = ", "format = 7 # "))
         error = io.StringIO()
@@ -107,6 +123,86 @@ timezone = "UTC"
         self.assertNotEqual(result, 0)
         self.assertIn("configuration error", error.getvalue())
         self.assertNotIn(secret, error.getvalue())
+
+    def test_invalid_run_settings_fail_before_extraction(self) -> None:
+        invalid_settings = (
+            ('format = "parquet"', 'format = "parqet"'),
+            ('destination = "file:///exports"', 'destination = "gs://bucket/x"'),
+            ("overlap = 7", 'overlap = "seven"'),
+            ("reconciliation_cadence = 30", 'reconciliation_cadence = "seven"'),
+        )
+        for original, replacement in invalid_settings:
+            for dry_run in (False, True):
+                with self.subTest(replacement=replacement, dry_run=dry_run):
+                    path = self.write_config(
+                        self.valid_config().replace(original, replacement)
+                    )
+                    extraction = Mock()
+                    error = io.StringIO()
+                    arguments = ["--config", str(path)]
+                    if dry_run:
+                        arguments.append("--dry-run")
+
+                    result = main(
+                        arguments,
+                        environ={"LASTFM_TEST_API_KEY": "test-key"},
+                        error_output=error,
+                        transport_factory=lambda _: extraction,
+                    )
+
+                    self.assertEqual(result, 2)
+                    self.assertIn("configuration error", error.getvalue())
+                    extraction.extract.assert_not_called()
+
+    def test_invalid_since_fails_before_extraction_with_or_without_dry_run(
+        self,
+    ) -> None:
+        path = self.write_config(self.valid_config())
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                extraction = Mock()
+                error = io.StringIO()
+                arguments = [
+                    "--config",
+                    str(path),
+                    "--since",
+                    "garbage",
+                ]
+                if dry_run:
+                    arguments.append("--dry-run")
+
+                result = main(
+                    arguments,
+                    environ={"LASTFM_TEST_API_KEY": "test-key"},
+                    error_output=error,
+                    transport_factory=lambda _: extraction,
+                )
+
+                self.assertEqual(result, 2)
+                self.assertIn("--since", error.getvalue())
+                extraction.extract.assert_not_called()
+
+    def test_since_is_normalized_before_coordinator_parsing(self) -> None:
+        path = self.write_config(self.valid_config())
+        captured: list[RunRequest] = []
+
+        with patch(
+            "lastfm_export.cli.run",
+            side_effect=lambda request, **_: captured.append(request) or 0,
+        ):
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--since",
+                    " 2024-01-01T00:00:00Z ",
+                    "--dry-run",
+                ],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured[0].since, "2024-01-01T00:00:00+00:00")
 
     def test_missing_selected_user_credential_returns_error_without_secret_value(
         self,
