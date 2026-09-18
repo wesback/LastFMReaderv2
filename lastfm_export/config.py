@@ -68,8 +68,12 @@ def load_config(
     *,
     selected_user: str | None = None,
     environ: Mapping[str, str] | None = None,
+    require_api_key: bool = True,
 ) -> ExporterConfig:
     """Load, validate, and normalize a TOML exporter configuration.
+
+    Set ``require_api_key`` to ``False`` for read-only commands such as status
+    that inspect durable state without making Last.fm requests.
 
     The canonical TOML shape is::
 
@@ -115,7 +119,7 @@ def load_config(
     )
 
     environment = os.environ if environ is None else environ
-    if not environment.get(api_key_env):
+    if require_api_key and not environment.get(api_key_env):
         raise ConfigurationError(
             f"API-key environment variable {api_key_env!r} is unset"
         )

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import Callable, Protocol, TextIO
 
 from .config import ConfigurationError, ExporterConfig, load_config
 from .progress import ProgressReporter
+from .state import CheckpointStore, StateStoreError
 
 
 @dataclass(frozen=True)
@@ -32,13 +35,21 @@ class RunRequest:
 
 TransportFactory = Callable[[RunRequest], object]
 DestinationWriterFactory = Callable[[RunRequest], object]
+Clock = Callable[[], float]
+
+
+class CheckpointReader(Protocol):
+    """Read-only checkpoint boundary used by the status command."""
+
+    def get_last_successful_to(self, username: str) -> int | None:
+        """Return a user's last successful watermark, if initialized."""
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the exporter command-line parser."""
     parser = argparse.ArgumentParser(
         prog="lastfm-export",
-        description="Export Last.fm scrobble history.",
+        description="Export Last.fm scrobble history or inspect checkpoint status.",
     )
     parser.add_argument(
         "--config",
@@ -54,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "user",
         nargs="?",
-        help="run only the named configured user",
+        help="run only the named configured user, or use 'status' for checkpoint status",
     )
     parser.add_argument(
         "--since",
@@ -70,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-resync",
         action="store_true",
         help="run a full historical resynchronization",
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=str,
+        help="directory containing durable checkpoint state",
     )
     return parser
 
@@ -174,6 +190,51 @@ def run(
     )
 
 
+def execute_status(
+    config: ExporterConfig,
+    *,
+    checkpoint_store: CheckpointReader,
+    clock: Clock = time.time,
+    output: TextIO,
+) -> int:
+    """Emit one JSON record per configured user from checkpoint state only."""
+    current_time = clock()
+    for user in config.users:
+        watermark = checkpoint_store.get_last_successful_to(user.username)
+        record: dict[str, object] = {
+            "username": user.username,
+            "last_successful_to": watermark,
+            "status": "initialized" if watermark is not None else "uninitialized",
+            "staleness_seconds": (
+                max(0, current_time - watermark)
+                if watermark is not None
+                else None
+            ),
+        }
+        print(json.dumps(record, sort_keys=True), file=output)
+    return 0
+
+
+def _is_status_command(arguments: argparse.Namespace) -> bool:
+    return arguments.user == "status"
+
+
+def _checkpoint_store_for_status(
+    *,
+    checkpoint_store: CheckpointReader | None,
+    config_path: Path,
+    state_dir: str | None,
+) -> CheckpointReader:
+    if checkpoint_store is not None:
+        return checkpoint_store
+    directory = (
+        Path(state_dir)
+        if state_dir is not None
+        else config_path.parent / ".lastfm-export"
+    )
+    return CheckpointStore(directory)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -182,6 +243,8 @@ def main(
     error_output: TextIO | None = None,
     transport_factory: TransportFactory | None = None,
     destination_writer_factory: DestinationWriterFactory | None = None,
+    checkpoint_store: CheckpointReader | None = None,
+    clock: Clock = time.time,
 ) -> int:
     """Run the exporter command."""
     parser = build_parser()
@@ -191,6 +254,7 @@ def main(
         error_output if error_output is not None else sys.stderr
     )
 
+    status_command = _is_status_command(arguments)
     if not arguments.config:
         has_run_options = any(
             (
@@ -210,13 +274,29 @@ def main(
         parser.print_help(file=output_stream)
         return 0
 
-    selected_user = arguments.selected_user or arguments.user
+    selected_user = (
+        arguments.selected_user
+        if arguments.selected_user is not None
+        else (None if status_command else arguments.user)
+    )
     try:
         config = load_config(
             arguments.config,
             selected_user=selected_user,
             environ=environ,
+            require_api_key=not status_command,
         )
+        if status_command:
+            return execute_status(
+                config,
+                checkpoint_store=_checkpoint_store_for_status(
+                    checkpoint_store=checkpoint_store,
+                    config_path=Path(arguments.config),
+                    state_dir=arguments.state_dir,
+                ),
+                clock=clock,
+                output=output_stream,
+            )
         request = build_run_request(
             arguments,
             config,
@@ -224,6 +304,9 @@ def main(
         )
     except ConfigurationError as error:
         print(f"configuration error: {error}", file=error_stream)
+        return 2
+    except StateStoreError as error:
+        print(f"state error: {error}", file=error_stream)
         return 2
 
     return run(
@@ -242,6 +325,7 @@ __all__ = [
     "build_parser",
     "build_run_request",
     "execute_run",
+    "execute_status",
     "main",
     "parse_run_request",
     "run",
