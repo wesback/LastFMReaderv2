@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from lastfm_export.cli import ProgressReporter, RunRequest, main
+from lastfm_export.workflow import ReconciliationWorkflow
 
 
 class CliTests(unittest.TestCase):
@@ -67,6 +68,10 @@ timezone = "UTC"
         self.assertEqual(captured[0].since, "2024-01-01")
         self.assertTrue(captured[0].dry_run)
         self.assertTrue(captured[0].full_resync)
+        self.assertEqual(
+            captured[0].reconciliation_workflow,
+            ReconciliationWorkflow.FULL_RESYNC,
+        )
         self.assertEqual(error.getvalue(), "")
 
     def test_dry_run_does_not_call_transport_or_destination_writer(self) -> None:
