@@ -1,6 +1,7 @@
 """Installable Last.fm scrobble exporter package."""
 
 from .config import ConfigurationError, ExporterConfig, UserConfig, load_config
+from .cli import RunRequest
 from .logging import (
     REDACTION_MARKER,
     RunSummary,
@@ -10,6 +11,7 @@ from .logging import (
     serialize_log_record,
     serialize_run_summary,
 )
+from .progress import ProgressReporter
 from .state import CheckpointStore, Lease, StateStoreError
 from .titles import DEFAULT_ANNOTATION_KEYWORDS, clean_title
 
@@ -23,6 +25,8 @@ __all__ = [
     "Lease",
     "REDACTION_MARKER",
     "RunSummary",
+    "RunRequest",
+    "ProgressReporter",
     "SecretRedactor",
     "StateStoreError",
     "UserConfig",
