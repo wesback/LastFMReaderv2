@@ -161,6 +161,17 @@ class LastFMClient:
 
         raise AssertionError("retry loop exhausted without returning or raising")
 
+    def get_scrobbles(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[Mapping[str, Any]]:
+        """Retrieve dated scrobbles for a fixed, bounded run window."""
+        from .retrieval import RecentTracksPaginator
+
+        return RecentTracksPaginator(self).fetch(username, window=window)
+
     def close(self) -> None:
         """Close the underlying HTTP client."""
         self._client.close()

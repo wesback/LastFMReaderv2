@@ -21,6 +21,7 @@ from .logging import (
     serialize_run_summary,
 )
 from .progress import ProgressReporter
+from .retrieval import RecentTracksPaginator, Track, retrieve_scrobbles
 from .state import CheckpointStore, Lease, StateStoreError
 from .titles import (
     DEFAULT_ANNOTATION_KEYWORDS,
@@ -47,10 +48,12 @@ __all__ = [
     "LastFMClient",
     "LastFMError",
     "ProgressReporter",
+    "RecentTracksPaginator",
     "RecentTracksWindow",
     "SecretRedactor",
     "StateStoreError",
     "TitleEnrichment",
+    "Track",
     "UserConfig",
     "__version__",
     "clean_title",
@@ -60,4 +63,5 @@ __all__ = [
     "serialize_log_record",
     "serialize_run_summary",
     "load_config",
+    "retrieve_scrobbles",
 ]
