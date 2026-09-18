@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -30,6 +31,7 @@ from .workflow import (
     IncrementalRunCoordinator,
     LandingWriterPort,
     ReconciliationWorkflow,
+    _call_extraction,
 )
 
 
@@ -213,6 +215,7 @@ class _ConfiguredExtraction:
         username: str,
         *,
         window: RecentTracksWindow,
+        on_page: Callable[[], None] | None = None,
     ) -> list[object]:
         self.client.reset_metrics()
         self.pages_fetched = 0
@@ -221,7 +224,24 @@ class _ConfiguredExtraction:
         self.retry_causes = ()
         self.rows_extracted = 0
         try:
-            tracks = self.client.get_scrobbles(username, window=window)
+            try:
+                parameters = inspect.signature(
+                    self.client.get_scrobbles
+                ).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            if any(
+                parameter.name == "on_page"
+                or parameter.kind is parameter.VAR_KEYWORD
+                for parameter in parameters
+            ):
+                tracks = self.client.get_scrobbles(
+                    username,
+                    window=window,
+                    on_page=on_page,
+                )
+            else:
+                tracks = self.client.get_scrobbles(username, window=window)
             self.rows_extracted = len(tracks)
             user = self.request.config.user(username)
             rows = []
@@ -297,8 +317,14 @@ def _extraction_port(
                 username: str,
                 *,
                 window: RecentTracksWindow,
+                on_page: Callable[[], None] | None = None,
             ) -> object:
-                return value(username, window=window)
+                return _call_extraction(
+                    value,
+                    username,
+                    window=window,
+                    on_page=on_page,
+                )
 
         return CallableExtraction()
     raise TypeError("transport factory must return an extraction port")
@@ -341,10 +367,16 @@ class _MeasuredExtraction:
         username: str,
         *,
         window: RecentTracksWindow,
+        on_page: Callable[[], None] | None = None,
     ) -> object:
         records: object = ()
         try:
-            records = self.delegate.extract(username, window=window)
+            records = _call_extraction(
+                self.delegate.extract,
+                username,
+                window=window,
+                on_page=on_page,
+            )
             self.last_records = records
             return records
         finally:

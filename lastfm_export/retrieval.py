@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from .client import LastFMClient, LastFMError, RecentTracksWindow
@@ -34,6 +34,7 @@ class RecentTracksPaginator:
         username: str,
         *,
         window: RecentTracksWindow,
+        on_page: Callable[[], None] | None = None,
     ) -> list[Track]:
         """Fetch pages through page one’s reported ``totalPages``.
 
@@ -51,6 +52,8 @@ class RecentTracksPaginator:
                 page=1,
             )
             pages_fetched += 1
+            if on_page is not None:
+                on_page()
             total_pages = _total_pages(first_page)
             tracks, skipped = _dated_tracks(first_page, window)
             rows_skipped_now_playing += skipped
@@ -62,6 +65,8 @@ class RecentTracksPaginator:
                     page=page,
                 )
                 pages_fetched += 1
+                if on_page is not None:
+                    on_page()
                 page_tracks, skipped = _dated_tracks(response, window)
                 tracks.extend(page_tracks)
                 rows_skipped_now_playing += skipped
@@ -75,9 +80,14 @@ def retrieve_scrobbles(
     username: str,
     *,
     window: RecentTracksWindow,
+    on_page: Callable[[], None] | None = None,
 ) -> list[Track]:
     """Retrieve dated scrobbles through the bounded request client."""
-    return RecentTracksPaginator(client).fetch(username, window=window)
+    return RecentTracksPaginator(client).fetch(
+        username,
+        window=window,
+        on_page=on_page,
+    )
 
 
 def _validate_bounded_window(window: RecentTracksWindow) -> None:

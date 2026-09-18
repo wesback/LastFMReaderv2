@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ class ExtractionPort(Protocol[Extracted]):
         username: str,
         *,
         window: RecentTracksWindow,
+        on_page: Callable[[], None] | None = None,
     ) -> Extracted:
         """Extract records from exactly the supplied half-open window."""
 
@@ -130,8 +132,14 @@ class RecentTracksExtraction(Generic[Extracted]):
         username: str,
         *,
         window: RecentTracksWindow,
+        on_page: Callable[[], None] | None = None,
     ) -> Extracted:
-        return self._extract(username, window=window)
+        return _call_extraction(
+            self._extract,
+            username,
+            window=window,
+            on_page=on_page,
+        )
 
 
 class LandingWriterPort(Generic[Extracted]):
@@ -217,7 +225,7 @@ class IncrementalRunCoordinator(Generic[Extracted]):
             )
 
         try:
-            self._require_active_lease(lease)
+            lease = self._renew_lease(lease)
             checkpoint = self._checkpoint_store.get_last_successful_to(username)
             window = _window(
                 start=(
@@ -230,15 +238,25 @@ class IncrementalRunCoordinator(Generic[Extracted]):
                 ),
                 end=run_start,
             )
-            self._require_active_lease(lease)
-            records = self._extraction.extract(username, window=window)
-            self._require_active_lease(lease)
+            lease = self._renew_lease(lease)
+
+            def renew_for_page() -> None:
+                nonlocal lease
+                lease = self._renew_lease(lease)
+
+            records = _call_extraction(
+                self._extraction.extract,
+                username,
+                window=window,
+                on_page=renew_for_page,
+            )
+            lease = self._renew_lease(lease)
             self._landing.land(
                 username,
                 window=window,
                 records=records,
             )
-            self._require_active_lease(lease)
+            lease = self._renew_lease(lease)
             self._checkpoint_store.record_successful_to(
                 username,
                 window.to_timestamp,
@@ -248,9 +266,11 @@ class IncrementalRunCoordinator(Generic[Extracted]):
         finally:
             lease.release()
 
-    def _require_active_lease(self, lease: Lease) -> None:
-        if not self._checkpoint_store.is_lease_active(lease):
+    def _renew_lease(self, lease: Lease) -> Lease:
+        renewed = lease.renew(self._lease_ttl_seconds)
+        if renewed is None:
             raise IncrementalRunError("incremental run lease expired or was lost")
+        return renewed
 
 
 def run_incremental(
@@ -330,7 +350,7 @@ class FullResyncRunCoordinator(Generic[Extracted]):
             )
 
         try:
-            self._require_active_lease(lease)
+            lease = self._renew_lease(lease)
             committed = set(
                 self._checkpoint_store.get_committed_full_resync_chunks(
                     username,
@@ -339,17 +359,27 @@ class FullResyncRunCoordinator(Generic[Extracted]):
             )
             chunks = calendar_year_chunks(interval)
             for chunk in chunks:
-                self._require_active_lease(lease)
+                lease = self._renew_lease(lease)
                 if chunk in committed:
                     continue
-                records = self._extraction.extract(username, window=chunk)
-                self._require_active_lease(lease)
+
+                def renew_for_page() -> None:
+                    nonlocal lease
+                    lease = self._renew_lease(lease)
+
+                records = _call_extraction(
+                    self._extraction.extract,
+                    username,
+                    window=chunk,
+                    on_page=renew_for_page,
+                )
+                lease = self._renew_lease(lease)
                 self._landing.land(
                     username,
                     window=chunk,
                     records=records,
                 )
-                self._require_active_lease(lease)
+                lease = self._renew_lease(lease)
                 self._checkpoint_store.record_committed_full_resync_chunk(
                     username,
                     interval=interval,
@@ -357,7 +387,7 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                     lease=lease,
                 )
                 committed.add(chunk)
-            self._require_active_lease(lease)
+            lease = self._renew_lease(lease)
             self._checkpoint_store.record_full_resync_completed(
                 username,
                 _timestamp(self._clock(), name="full-resync completion"),
@@ -367,9 +397,11 @@ class FullResyncRunCoordinator(Generic[Extracted]):
         finally:
             lease.release()
 
-    def _require_active_lease(self, lease: Lease) -> None:
-        if not self._checkpoint_store.is_lease_active(lease):
+    def _renew_lease(self, lease: Lease) -> Lease:
+        renewed = lease.renew(self._lease_ttl_seconds)
+        if renewed is None:
             raise FullResyncRunError("full resync lease expired or was lost")
+        return renewed
 
 
 # Keep the shorter name available for callers that treat reconciliation as a
@@ -490,6 +522,28 @@ def _cadence_seconds(cadence_days: int | float | str) -> float:
     if not isfinite(cadence) or cadence < 0:
         raise ValueError("cadence_days must be finite and non-negative")
     return cadence * 24 * 60 * 60
+
+
+def _call_extraction(
+    extract: Callable[..., Extracted],
+    username: str,
+    *,
+    window: RecentTracksWindow,
+    on_page: Callable[[], None] | None,
+) -> Extracted:
+    """Invoke extraction with a page hook when the port supports it."""
+    try:
+        parameters = inspect.signature(extract).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    accepts_callback = any(
+        parameter.name == "on_page"
+        or parameter.kind is parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if accepts_callback:
+        return extract(username, window=window, on_page=on_page)
+    return extract(username, window=window)
 
 
 def _timestamp(value: Timestamp, *, name: str) -> int:

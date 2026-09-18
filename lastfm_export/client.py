@@ -173,13 +173,18 @@ class LastFMClient:
         username: str,
         *,
         window: RecentTracksWindow,
+        on_page: Callable[[], None] | None = None,
     ) -> list[Mapping[str, Any]]:
         """Retrieve dated scrobbles for a fixed, bounded run window."""
         from .retrieval import RecentTracksPaginator
 
         paginator = RecentTracksPaginator(self)
         try:
-            result = paginator.fetch(username, window=window)
+            result = paginator.fetch(
+                username,
+                window=window,
+                on_page=on_page,
+            )
         finally:
             self.last_retrieval_stats = paginator.stats
         return result
