@@ -23,6 +23,16 @@ from .logging import (
 from .progress import ProgressReporter
 from .retrieval import RecentTracksPaginator, Track, retrieve_scrobbles
 from .state import CheckpointStore, Lease, StateStoreError
+from .workflow import (
+    CheckpointPort,
+    ExtractionPort,
+    IncrementalRunCoordinator,
+    IncrementalRunError,
+    LandingPort,
+    LandingWriterPort,
+    RecentTracksExtraction,
+    run_incremental,
+)
 from .landing import LandingRow, build_landing_row, natural_key_surrogate, normalize_track
 from .output import (
     FsspecLandingWriter,
@@ -42,10 +52,12 @@ __version__ = "0.1.0"
 
 __all__ = [
     "CheckpointStore",
+    "CheckpointPort",
     "ConfigurationError",
     "DEFAULT_ANNOTATION_KEYWORDS",
     "DEFAULT_RETRY_DELAY",
     "ExporterConfig",
+    "ExtractionPort",
     "FsspecLandingWriter",
     "Lease",
     "LASTFM_ENDPOINT",
@@ -57,11 +69,14 @@ __all__ = [
     "LastFMClient",
     "LastFMError",
     "LandingRow",
+    "LandingPort",
+    "LandingWriterPort",
     "LocalDestinationWriter",
     "LocalLandingWriter",
     "NORMALIZED_COLUMNS",
     "ProgressReporter",
     "RecentTracksPaginator",
+    "RecentTracksExtraction",
     "RecentTracksWindow",
     "SecretRedactor",
     "StateStoreError",
@@ -81,4 +96,7 @@ __all__ = [
     "natural_key_surrogate",
     "normalize_track",
     "retrieve_scrobbles",
+    "IncrementalRunCoordinator",
+    "IncrementalRunError",
+    "run_incremental",
 ]

@@ -2,8 +2,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from lastfm_export.state import CheckpointStore
+from lastfm_export.state import CheckpointStore, StateStoreError
 
 
 class CheckpointStoreTests(unittest.TestCase):
@@ -49,6 +50,24 @@ class CheckpointStoreTests(unittest.TestCase):
                 reopened_after_failure.get_last_successful_to("alice"),
                 100,
             )
+
+    def test_expired_lease_cannot_commit_a_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            store.record_successful_to("alice", 100)
+
+            with patch("lastfm_export.state.time.time", return_value=10.0):
+                lease = store.acquire_lease("alice", ttl_seconds=1)
+            self.assertIsNotNone(lease)
+
+            with patch("lastfm_export.state.time.time", return_value=12.0):
+                with self.assertRaisesRegex(
+                    StateStoreError,
+                    "no active lease",
+                ):
+                    store.record_successful_to("alice", 200, lease=lease)
+
+            self.assertEqual(store.get_last_successful_to("alice"), 100)
 
 
 if __name__ == "__main__":
