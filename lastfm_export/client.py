@@ -1,0 +1,241 @@
+"""Synchronous HTTP boundary for Last.fm recent-track reads."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from typing import Any
+
+import httpx
+
+LASTFM_ENDPOINT = "https://ws.audioscrobbler.com/2.0/"
+RETRYABLE_ERROR_CODES = frozenset({11, 16, 29})
+DEFAULT_RETRY_DELAY = 0.4
+
+
+class LastFMError(RuntimeError):
+    """Base class for errors returned by or raised while calling Last.fm."""
+
+
+class LastFMAPIError(LastFMError):
+    """An error response returned by the Last.fm API."""
+
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        *,
+        response: httpx.Response | None = None,
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.response = response
+        super().__init__(f"Last.fm API error {code}: {message}")
+
+
+@dataclass(frozen=True)
+class RecentTracksWindow:
+    """Optional inclusive Last.fm Unix timestamp bounds for a request."""
+
+    from_timestamp: int | None = None
+    to_timestamp: int | None = None
+
+
+class LastFMClient:
+    """Read recent tracks from Last.fm with bounded transient retries.
+
+    The client owns the underlying synchronous ``httpx.Client`` and can be
+    supplied a transport, sleeper, and clock to make request behavior
+    deterministic in tests.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        endpoint: str = LASTFM_ENDPOINT,
+        connect_timeout: float = 5.0,
+        read_timeout: float = 30.0,
+        max_retries: int = 3,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
+        transport: httpx.BaseTransport | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if not api_key:
+            raise ValueError("api_key must not be empty")
+        if connect_timeout <= 0 or read_timeout <= 0:
+            raise ValueError("connect_timeout and read_timeout must be positive")
+        if max_retries < 0:
+            raise ValueError("max_retries must not be negative")
+        if retry_delay < DEFAULT_RETRY_DELAY:
+            raise ValueError(
+                f"retry_delay must be at least {DEFAULT_RETRY_DELAY} seconds"
+            )
+
+        self._api_key = api_key
+        self._endpoint = endpoint
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay
+        self._sleeper = sleeper
+        self._clock = clock
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=connect_timeout,
+                read=read_timeout,
+                write=read_timeout,
+                pool=connect_timeout,
+            ),
+            transport=transport,
+        )
+
+    def get_recent_tracks(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow | None = None,
+        from_timestamp: int | None = None,
+        to_timestamp: int | None = None,
+        page: int = 1,
+    ) -> Mapping[str, Any]:
+        """Fetch one page of ``user.getRecentTracks`` results.
+
+        ``from_timestamp`` and ``to_timestamp`` are Unix timestamps. A
+        ``RecentTracksWindow`` may be used instead when the caller already has
+        a validated window object.
+        """
+        if not username:
+            raise ValueError("username must not be empty")
+        if page < 1:
+            raise ValueError("page must be at least 1")
+        if window is not None:
+            if from_timestamp is not None or to_timestamp is not None:
+                raise ValueError("provide window or timestamp bounds, not both")
+            from_timestamp = window.from_timestamp
+            to_timestamp = window.to_timestamp
+        if from_timestamp is not None and from_timestamp < 0:
+            raise ValueError("from_timestamp must not be negative")
+        if to_timestamp is not None and to_timestamp < 0:
+            raise ValueError("to_timestamp must not be negative")
+        if (
+            from_timestamp is not None
+            and to_timestamp is not None
+            and from_timestamp > to_timestamp
+        ):
+            raise ValueError("from_timestamp must not be later than to_timestamp")
+
+        params: dict[str, str | int] = {
+            "method": "user.getRecentTracks",
+            "api_key": self._api_key,
+            "user": username,
+            "limit": 200,
+            "page": page,
+            "format": "json",
+        }
+        if from_timestamp is not None:
+            params["from"] = from_timestamp
+        if to_timestamp is not None:
+            params["to"] = to_timestamp
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._client.get(self._endpoint, params=params)
+            except httpx.TimeoutException:
+                if attempt == self._max_retries:
+                    raise
+                self._sleeper(self._retry_delay_for(attempt))
+                continue
+
+            payload = self._decode_payload(response)
+            error = _api_error(payload, response)
+            if error is None:
+                response.raise_for_status()
+                return payload
+            if error.code not in RETRYABLE_ERROR_CODES:
+                raise error
+            if attempt == self._max_retries:
+                raise error
+            self._sleeper(self._retry_delay_for(attempt, response=response))
+
+        raise AssertionError("retry loop exhausted without returning or raising")
+
+    def close(self) -> None:
+        """Close the underlying HTTP client."""
+        self._client.close()
+
+    def __enter__(self) -> LastFMClient:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _retry_delay_for(
+        self,
+        retry_index: int,
+        *,
+        response: httpx.Response | None = None,
+    ) -> float:
+        retry_after = _retry_after_seconds(
+            response.headers if response is not None else {},
+            now=self._clock(),
+        )
+        computed = self._retry_delay * (2**retry_index)
+        delay = retry_after if retry_after is not None else computed
+        return max(DEFAULT_RETRY_DELAY, delay)
+
+    @staticmethod
+    def _decode_payload(response: httpx.Response) -> Mapping[str, Any]:
+        try:
+            payload = response.json()
+        except ValueError as error:
+            response.raise_for_status()
+            raise LastFMError("Last.fm returned invalid JSON") from error
+        if not isinstance(payload, Mapping):
+            raise LastFMError("Last.fm returned a non-object JSON response")
+        return payload
+
+
+def _api_error(
+    payload: Mapping[str, Any],
+    response: httpx.Response,
+) -> LastFMAPIError | None:
+    code = payload.get("error")
+    if code is None:
+        return None
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise LastFMError("Last.fm returned an invalid API error code")
+    message = payload.get("message", "unknown Last.fm API error")
+    if not isinstance(message, str):
+        message = str(message)
+    return LastFMAPIError(code, message, response=response)
+
+
+def _retry_after_seconds(
+    headers: Mapping[str, str],
+    *,
+    now: float,
+) -> float | None:
+    value = headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return max(0.0, retry_at - now)
+
+
+__all__ = [
+    "DEFAULT_RETRY_DELAY",
+    "LASTFM_ENDPOINT",
+    "RETRYABLE_ERROR_CODES",
+    "LastFMAPIError",
+    "LastFMClient",
+    "LastFMError",
+    "RecentTracksWindow",
+]

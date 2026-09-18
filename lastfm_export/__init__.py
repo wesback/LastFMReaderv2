@@ -1,6 +1,15 @@
 """Installable Last.fm scrobble exporter package."""
 
 from .config import ConfigurationError, ExporterConfig, UserConfig, load_config
+from .client import (
+    DEFAULT_RETRY_DELAY,
+    LASTFM_ENDPOINT,
+    RETRYABLE_ERROR_CODES,
+    LastFMAPIError,
+    LastFMClient,
+    LastFMError,
+    RecentTracksWindow,
+)
 from .cli import RunRequest
 from .logging import (
     REDACTION_MARKER,
@@ -26,12 +35,19 @@ __all__ = [
     "CheckpointStore",
     "ConfigurationError",
     "DEFAULT_ANNOTATION_KEYWORDS",
+    "DEFAULT_RETRY_DELAY",
     "ExporterConfig",
     "Lease",
+    "LASTFM_ENDPOINT",
+    "RETRYABLE_ERROR_CODES",
     "REDACTION_MARKER",
     "RunSummary",
     "RunRequest",
+    "LastFMAPIError",
+    "LastFMClient",
+    "LastFMError",
     "ProgressReporter",
+    "RecentTracksWindow",
     "SecretRedactor",
     "StateStoreError",
     "TitleEnrichment",
