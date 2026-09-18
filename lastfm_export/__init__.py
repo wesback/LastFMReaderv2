@@ -23,6 +23,7 @@ from .logging import (
 from .progress import ProgressReporter
 from .retrieval import RecentTracksPaginator, Track, retrieve_scrobbles
 from .state import CheckpointStore, Lease, StateStoreError
+from .landing import LandingRow, build_landing_row, natural_key_surrogate, normalize_track
 from .titles import (
     DEFAULT_ANNOTATION_KEYWORDS,
     TitleEnrichment,
@@ -47,6 +48,7 @@ __all__ = [
     "LastFMAPIError",
     "LastFMClient",
     "LastFMError",
+    "LandingRow",
     "ProgressReporter",
     "RecentTracksPaginator",
     "RecentTracksWindow",
@@ -57,11 +59,14 @@ __all__ = [
     "UserConfig",
     "__version__",
     "clean_title",
+    "build_landing_row",
     "enrich_title",
     "exception_log_record",
     "serialize_exception_log_record",
     "serialize_log_record",
     "serialize_run_summary",
     "load_config",
+    "natural_key_surrogate",
+    "normalize_track",
     "retrieve_scrobbles",
 ]
