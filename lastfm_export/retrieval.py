@@ -1,0 +1,130 @@
+"""Bounded retrieval of dated Last.fm scrobbles."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from .client import LastFMClient, LastFMError, RecentTracksWindow
+
+Track = Mapping[str, Any]
+
+
+class RecentTracksPaginator:
+    """Retrieve all dated tracks in a caller-supplied fixed time window."""
+
+    def __init__(self, client: LastFMClient) -> None:
+        self._client = client
+
+    def fetch(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[Track]:
+        """Fetch pages through page one’s reported ``totalPages``.
+
+        The page count is deliberately read only from the first response.
+        Last.fm result counts can change while later pages are being read, but
+        a fixed first-page boundary keeps a run bounded and repeatable.
+        """
+        _validate_bounded_window(window)
+        first_page = self._client.get_recent_tracks(
+            username,
+            window=window,
+            page=1,
+        )
+        total_pages = _total_pages(first_page)
+        tracks = _dated_tracks(first_page, window)
+
+        for page in range(2, total_pages + 1):
+            response = self._client.get_recent_tracks(
+                username,
+                window=window,
+                page=page,
+            )
+            tracks.extend(_dated_tracks(response, window))
+        return tracks
+
+
+def retrieve_scrobbles(
+    client: LastFMClient,
+    username: str,
+    *,
+    window: RecentTracksWindow,
+) -> list[Track]:
+    """Retrieve dated scrobbles through the bounded request client."""
+    return RecentTracksPaginator(client).fetch(username, window=window)
+
+
+def _validate_bounded_window(window: RecentTracksWindow) -> None:
+    if window.from_timestamp is None or window.to_timestamp is None:
+        raise ValueError("bounded retrieval requires both window timestamps")
+    if window.from_timestamp < 0 or window.to_timestamp < 0:
+        raise ValueError("window timestamps must not be negative")
+    if window.from_timestamp > window.to_timestamp:
+        raise ValueError("window from_timestamp must not be later than to_timestamp")
+
+
+def _total_pages(payload: Mapping[str, Any]) -> int:
+    recent_tracks = payload.get("recenttracks")
+    if not isinstance(recent_tracks, Mapping):
+        raise LastFMError("Last.fm response is missing recenttracks")
+    attributes = recent_tracks.get("@attr")
+    if not isinstance(attributes, Mapping):
+        raise LastFMError("Last.fm response is missing recenttracks attributes")
+    value = attributes.get("totalPages")
+    if isinstance(value, bool):
+        raise LastFMError("Last.fm response contains an invalid totalPages value")
+    try:
+        total_pages = int(value)
+    except (TypeError, ValueError):
+        raise LastFMError(
+            "Last.fm response contains an invalid totalPages value"
+        ) from None
+    if total_pages < 1:
+        raise LastFMError("Last.fm response contains an invalid totalPages value")
+    return total_pages
+
+
+def _dated_tracks(
+    payload: Mapping[str, Any],
+    window: RecentTracksWindow,
+) -> list[Track]:
+    recent_tracks = payload.get("recenttracks")
+    if not isinstance(recent_tracks, Mapping):
+        raise LastFMError("Last.fm response is missing recenttracks")
+    raw_tracks = recent_tracks.get("track", [])
+    if isinstance(raw_tracks, Mapping):
+        candidates = [raw_tracks]
+    elif isinstance(raw_tracks, list):
+        candidates = raw_tracks
+    else:
+        raise LastFMError("Last.fm response contains invalid track entries")
+
+    assert window.from_timestamp is not None
+    assert window.to_timestamp is not None
+    dated: list[Track] = []
+    for track in candidates:
+        if not isinstance(track, Mapping):
+            raise LastFMError("Last.fm response contains an invalid track")
+        date = track.get("date")
+        if date is None:
+            continue
+        if not isinstance(date, Mapping):
+            raise LastFMError("Last.fm response contains an invalid track date")
+        raw_timestamp = date.get("uts")
+        if isinstance(raw_timestamp, bool):
+            raise LastFMError("Last.fm response contains an invalid track timestamp")
+        try:
+            timestamp = int(raw_timestamp)
+        except (TypeError, ValueError):
+            raise LastFMError(
+                "Last.fm response contains an invalid track timestamp"
+            ) from None
+        if window.from_timestamp <= timestamp < window.to_timestamp:
+            dated.append(track)
+    return dated
+
+
+__all__ = ["RecentTracksPaginator", "Track", "retrieve_scrobbles"]
