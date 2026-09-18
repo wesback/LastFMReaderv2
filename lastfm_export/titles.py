@@ -182,7 +182,16 @@ def _correct_degenerate_case(title: str) -> str:
         return title
 
     lower_title = title.lower()
-    return _WORD.sub(
-        lambda match: match.group(0)[0].upper() + match.group(0)[1:],
-        lower_title,
-    )
+
+    def capitalize_word(match: re.Match[str]) -> str:
+        start = match.start()
+        if (
+            start >= 2
+            and lower_title[start - 1] in {"'", "\u2019"}
+            and lower_title[start - 2].isalpha()
+        ):
+            return match.group(0)
+        word = match.group(0)
+        return word[0].upper() + word[1:]
+
+    return _WORD.sub(capitalize_word, lower_title)

@@ -8,9 +8,21 @@ class TitleCleaningTests(unittest.TestCase):
         self.assertEqual(clean_title("HELLO WORLD"), "Hello World")
         self.assertEqual(clean_title("hello world"), "Hello World")
 
+    def test_corrects_contractions_and_possessives(self) -> None:
+        expected = "Don't Stop Me Now"
+        self.assertEqual(clean_title("DON'T STOP ME NOW"), expected)
+        self.assertEqual(clean_title("don't stop me now"), expected)
+        self.assertEqual(clean_title("I'M STILL STANDING"), "I'm Still Standing")
+        self.assertEqual(
+            clean_title("DON’T LOOK BACK IN ANGER"),
+            "Don’t Look Back In Anger",
+        )
+        self.assertEqual(clean_title("ROCK 'N' ROLL"), "Rock 'N' Roll")
+
     def test_leaves_mixed_case_titles_unchanged(self) -> None:
-        title = "deadmau5's P!nk Song"
-        self.assertEqual(clean_title(title), title)
+        for title in ("Don't Stop Me Now", "deadmau5's P!nk Song"):
+            with self.subTest(title=title):
+                self.assertEqual(clean_title(title), title)
 
     def test_removes_configured_trailing_annotations_iteratively(self) -> None:
         keywords = ("live", "remastered")
@@ -44,17 +56,20 @@ class TitleCleaningTests(unittest.TestCase):
         self.assertEqual(cleaned, "Song")
 
     def test_preserves_adversarial_titles(self) -> None:
-        titles = (
+        self.assertEqual(
+            clean_title("(I Can't Get No) Satisfaction"),
             "(I Can't Get No) Satisfaction",
-            "1999",
+        )
+        self.assertEqual(clean_title("1999"), "1999")
+        self.assertEqual(
+            clean_title("Happy (from Despicable Me 2)"),
             "Happy (from Despicable Me 2)",
-            "99 Luftballons",
+        )
+        self.assertEqual(clean_title("99 Luftballons"), "99 Luftballons")
+        self.assertEqual(
+            clean_title("(Sittin' On) The Dock of the Bay"),
             "(Sittin' On) The Dock of the Bay",
         )
-
-        for title in titles:
-            with self.subTest(title=title):
-                self.assertEqual(clean_title(title), title)
 
 
 class TitleEnrichmentTests(unittest.TestCase):
