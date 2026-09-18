@@ -1,13 +1,50 @@
+import json
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from lastfm_export.client import RecentTracksWindow
 from lastfm_export.state import CheckpointStore, StateStoreError
 
 
 class CheckpointStoreTests(unittest.TestCase):
+    def test_reads_legacy_interval_keyed_full_resync_state(self) -> None:
+        interval = RecentTracksWindow(1_514_764_800, 1_700_000_000)
+        chunk = RecentTracksWindow(1_514_764_800, 1_546_300_800)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "checkpoints": {},
+                        "leases": {},
+                        "full_resync": {
+                            "alice": {
+                                "1514764800:1700000000": [
+                                    {
+                                        "from": chunk.from_timestamp,
+                                        "to": chunk.to_timestamp,
+                                    }
+                                ]
+                            }
+                        },
+                        "full_resync_completed_at": {},
+                    }
+                )
+            )
+
+            store = CheckpointStore(directory)
+            self.assertEqual(
+                store.get_committed_full_resync_chunks(
+                    "alice",
+                    interval=interval,
+                ),
+                (chunk,),
+            )
+
     def test_persists_separate_checkpoints_when_reopened(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CheckpointStore(Path(directory))

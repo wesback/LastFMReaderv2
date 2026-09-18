@@ -351,13 +351,25 @@ class FullResyncRunCoordinator(Generic[Extracted]):
 
         try:
             lease = self._renew_lease(lease)
-            committed = set(
-                self._checkpoint_store.get_committed_full_resync_chunks(
-                    username,
-                    interval=interval,
+            completed_at = self._checkpoint_store.get_last_full_resync_at(
+                username
+            )
+            committed = (
+                set()
+                if completed_at is not None
+                else set(
+                    self._checkpoint_store.get_committed_full_resync_chunks(
+                        username,
+                        interval=interval,
+                    )
                 )
             )
             chunks = calendar_year_chunks(interval)
+            committed = {
+                chunk
+                for chunk in committed
+                if chunk in chunks and _is_closed_year_chunk(chunk)
+            }
             for chunk in chunks:
                 lease = self._renew_lease(lease)
                 if chunk in committed:
@@ -451,6 +463,20 @@ def calendar_year_chunks(
         chunks.append(RecentTracksWindow(current, boundary))
         current = boundary
     return tuple(chunks)
+
+
+def _is_closed_year_chunk(window: RecentTracksWindow) -> bool:
+    """Return whether a chunk ends at a UTC calendar-year boundary."""
+    _, end = _bounded_window(window, name="calendar-year chunk")
+    end_date = datetime.fromtimestamp(end, tz=timezone.utc)
+    return (
+        end_date.month == 1
+        and end_date.day == 1
+        and end_date.hour == 0
+        and end_date.minute == 0
+        and end_date.second == 0
+        and end_date.microsecond == 0
+    )
 
 
 def select_reconciliation_workflow(

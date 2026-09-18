@@ -97,9 +97,15 @@ class CheckpointStore:
         *,
         interval: RecentTracksWindow,
     ) -> tuple[RecentTracksWindow, ...]:
-        """Return committed chunks for one exact full-resync interval."""
+        """Return committed chunks matching any unfinished resync interval.
+
+        Older state files group chunks under the complete ``start:end``
+        interval key.  The run end changes on every invocation, so resuming
+        requires looking through those groups and matching the chunk bounds
+        themselves.
+        """
         username = self._validate_username(username)
-        interval_key = _interval_key(interval)
+        _window_bounds(interval)
         with self._locked():
             state = self._read_state()
             user_runs = state["full_resync"].get(username, {})
@@ -107,12 +113,22 @@ class CheckpointStore:
                 raise StateStoreError(
                     f"invalid full resync state for {username!r}"
                 )
-            records = user_runs.get(interval_key, [])
-            if not isinstance(records, list):
-                raise StateStoreError(
-                    f"invalid full resync chunks for {username!r}"
+            chunks: set[RecentTracksWindow] = set()
+            for records in user_runs.values():
+                if not isinstance(records, list):
+                    raise StateStoreError(
+                        f"invalid full resync chunks for {username!r}"
+                    )
+                chunks.update(_window_from_record(record) for record in records)
+            return tuple(
+                sorted(
+                    chunks,
+                    key=lambda chunk: (
+                        chunk.from_timestamp,
+                        chunk.to_timestamp,
+                    ),
                 )
-            return tuple(_window_from_record(record) for record in records)
+            )
 
     def record_committed_full_resync_chunk(
         self,
@@ -144,6 +160,10 @@ class CheckpointStore:
                 raise StateStoreError(
                     f"invalid full resync state for {username!r}"
                 )
+            if state["full_resync_completed_at"].get(username) is not None:
+                user_runs = {}
+                state["full_resync"][username] = user_runs
+                state["full_resync_completed_at"].pop(username, None)
             records = user_runs.setdefault(interval_key, [])
             if not isinstance(records, list):
                 raise StateStoreError(
