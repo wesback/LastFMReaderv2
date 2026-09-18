@@ -1,0 +1,27 @@
+# Copy this file to a deployment-owned path such as
+# /etc/lastfm-export/config.toml. It contains no API-key or cloud credential
+# value.
+
+[defaults]
+# The exporter reads the value of this environment variable at run time.
+api_key_env = "LASTFM_API_KEY"
+format = "parquet"
+destination = "file:///var/lib/lastfm-export/landing"
+overlap = 7
+reconciliation_cadence = 30
+
+# Every tracked user has an explicit IANA time zone. A user destination
+# overrides defaults.destination when present.
+[[tracked_users]]
+username = "alice"
+timezone = "Europe/Brussels"
+
+[[tracked_users]]
+username = "bob"
+timezone = "America/Los_Angeles"
+destination = "s3://example-lastfm-landing/bob"
+
+[[tracked_users]]
+username = "carol"
+timezone = "Asia/Tokyo"
+destination = "abfss://landing@examplelake.dfs.core.windows.net/carol"
