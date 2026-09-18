@@ -310,12 +310,24 @@ def _polars_frame(records: list[dict[str, Any]]) -> Any:
         "album_mbid": pl.String,
         "scrobbled_at_uts": pl.Int64,
         "scrobbled_at_utc": pl.Datetime(time_unit="us", time_zone="UTC"),
-        "scrobbled_at_local": pl.Datetime(time_unit="us"),
+        "scrobbled_at_local": pl.Datetime(
+            time_unit="us",
+            time_zone=_local_timezone(records),
+        ),
         "url": pl.String,
         "track_title_clean": pl.String,
         "featured_artists": pl.List(pl.String),
     }
     return pl.DataFrame(records, schema=schema)
+
+
+def _local_timezone(records: list[dict[str, Any]]) -> str | None:
+    if not records:
+        return None
+    value = records[0]["scrobbled_at_local"]
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    return getattr(value.tzinfo, "key", None) or str(value.tzinfo)
 
 
 def _temporary_path(final_path: Path) -> Path:

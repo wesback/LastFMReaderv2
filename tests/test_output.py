@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -37,6 +38,27 @@ def landing_row(*, track: str = "First Track", artist: str = "The Artist") -> La
         scrobbled_at_local=moment.replace(tzinfo=None),
         url="https://last.fm/track",
         track_title_clean=track,
+        featured_artists=None,
+    )
+
+
+def localized_landing_row(timestamp: int, zone: ZoneInfo) -> LandingRow:
+    moment_utc = datetime.fromtimestamp(timestamp, timezone.utc)
+    moment_local = moment_utc.astimezone(zone)
+    return LandingRow(
+        event_id=f"event-{timestamp}",
+        username="alice",
+        artist="The Artist",
+        artist_mbid=None,
+        track=f"Track {timestamp}",
+        track_mbid=None,
+        album="Album",
+        album_mbid=None,
+        scrobbled_at_uts=timestamp,
+        scrobbled_at_utc=moment_utc,
+        scrobbled_at_local=moment_local,
+        url="https://last.fm/track",
+        track_title_clean=f"Track {timestamp}",
         featured_artists=None,
     )
 
@@ -135,6 +157,110 @@ class OutputTests(unittest.TestCase):
                         actual = frame.to_dicts()[0]
                         expected = rows[0].as_dict()
                         self.assertEqual(actual, expected)
+
+    def test_preserves_local_timezone_in_all_landing_formats(self) -> None:
+        window = RecentTracksWindow(1_690_000_000, 1_700_000_001)
+        zone = ZoneInfo("Europe/Brussels")
+        rows = [
+            localized_landing_row(1_700_000_000, zone),
+            localized_landing_row(1_690_000_000, zone),
+        ]
+        expected_offsets = ["+01:00", "+02:00"]
+        expected_values = [
+            datetime(2023, 11, 14, 23, 13, 20, tzinfo=zone),
+            datetime(2023, 7, 22, 6, 26, 40, tzinfo=zone),
+        ]
+
+        for format_name in ("parquet", "jsonl", "csv"):
+            with self.subTest(format=format_name), tempfile.TemporaryDirectory() as directory:
+                path = LocalLandingWriter(directory, format_name).write(
+                    "alice",
+                    window,
+                    rows,
+                )
+
+                if format_name == "parquet":
+                    frame = pl.read_parquet(path)
+                    local = frame.get_column("scrobbled_at_local")
+                    self.assertEqual(local.dtype.time_zone, "Europe/Brussels")
+                    self.assertEqual(local.to_list(), expected_values)
+                else:
+                    if format_name == "jsonl":
+                        serialized = [
+                            json.loads(line)["scrobbled_at_local"]
+                            for line in path.read_text(encoding="utf-8").splitlines()
+                        ]
+                    else:
+                        with path.open(newline="", encoding="utf-8") as stream:
+                            serialized = [
+                                row["scrobbled_at_local"]
+                                for row in csv.DictReader(stream)
+                            ]
+                    for value, offset, timestamp in zip(
+                        serialized,
+                        expected_offsets,
+                        (1_700_000_000, 1_690_000_000),
+                    ):
+                        parsed = datetime.fromisoformat(
+                            value.replace(
+                                value[-5:-2] + value[-2:],
+                                value[-5:-2] + ":" + value[-2:],
+                            )
+                            if len(value) >= 5 and value[-5] in "+-"
+                            else value
+                        )
+                        self.assertIsNotNone(parsed.tzinfo)
+                        self.assertEqual(parsed.strftime("%z"), offset.replace(":", ""))
+                        self.assertEqual(parsed.timestamp(), timestamp)
+
+    def test_preserves_utc_timezone_and_writes_empty_landing_files(self) -> None:
+        window = RecentTracksWindow(1_690_000_000, 1_700_000_001)
+        rows = [
+            localized_landing_row(1_700_000_000, ZoneInfo("UTC")),
+            localized_landing_row(1_690_000_000, ZoneInfo("UTC")),
+        ]
+
+        for format_name in ("parquet", "jsonl", "csv"):
+            with self.subTest(format=format_name), tempfile.TemporaryDirectory() as directory:
+                writer = LocalLandingWriter(directory, format_name)
+                path = writer.write("alice", window, rows)
+                if format_name == "parquet":
+                    frame = pl.read_parquet(path)
+                    self.assertEqual(
+                        frame.get_column("scrobbled_at_local").dtype.time_zone,
+                        "UTC",
+                    )
+                    self.assertEqual(
+                        frame.get_column("scrobbled_at_local").to_list(),
+                        frame.get_column("scrobbled_at_utc").to_list(),
+                    )
+                else:
+                    if format_name == "jsonl":
+                        serialized = [
+                            json.loads(line)["scrobbled_at_local"]
+                            for line in path.read_text(encoding="utf-8").splitlines()
+                        ]
+                    else:
+                        with path.open(newline="", encoding="utf-8") as stream:
+                            serialized = [
+                                row["scrobbled_at_local"]
+                                for row in csv.DictReader(stream)
+                            ]
+                    for value, timestamp in zip(
+                        serialized,
+                        (1_700_000_000, 1_690_000_000),
+                    ):
+                        parsed = datetime.fromisoformat(value)
+                        self.assertIsNotNone(parsed.tzinfo)
+                        self.assertEqual(parsed.utcoffset(), timezone.utc.utcoffset(None))
+                        self.assertEqual(parsed.timestamp(), timestamp)
+
+                empty_path = writer.write(
+                    "alice",
+                    RecentTracksWindow(100, 200),
+                    [],
+                )
+                self.assertTrue(empty_path.is_file())
 
     def test_rewriting_same_window_replaces_the_deterministic_file(self) -> None:
         window = RecentTracksWindow(100, 200)
