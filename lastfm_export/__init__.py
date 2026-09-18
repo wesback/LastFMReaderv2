@@ -13,7 +13,12 @@ from .logging import (
 )
 from .progress import ProgressReporter
 from .state import CheckpointStore, Lease, StateStoreError
-from .titles import DEFAULT_ANNOTATION_KEYWORDS, clean_title
+from .titles import (
+    DEFAULT_ANNOTATION_KEYWORDS,
+    TitleEnrichment,
+    clean_title,
+    enrich_title,
+)
 
 __version__ = "0.1.0"
 
@@ -29,9 +34,11 @@ __all__ = [
     "ProgressReporter",
     "SecretRedactor",
     "StateStoreError",
+    "TitleEnrichment",
     "UserConfig",
     "__version__",
     "clean_title",
+    "enrich_title",
     "exception_log_record",
     "serialize_exception_log_record",
     "serialize_log_record",
