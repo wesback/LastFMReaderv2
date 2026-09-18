@@ -6,6 +6,7 @@ import httpx
 from lastfm_export.client import (
     LastFMAPIError,
     LastFMClient,
+    MIN_REQUEST_INTERVAL,
     RecentTracksWindow,
 )
 
@@ -202,6 +203,117 @@ class LastFMClientTests(unittest.TestCase):
         self.assertGreaterEqual(intervals[1], 0.4)
         self.assertAlmostEqual(intervals[0], 0.4)
         self.assertAlmostEqual(intervals[1], 0.8)
+
+    def test_consecutive_requests_are_throttled(self) -> None:
+        elapsed = 0.0
+        request_times: list[float] = []
+
+        def sleep(delay: float) -> None:
+            nonlocal elapsed
+            elapsed += delay
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_times.append(elapsed)
+            return httpx.Response(200, json={"recenttracks": {}})
+
+        with LastFMClient(
+            "key",
+            transport=httpx.MockTransport(handler),
+            sleeper=sleep,
+            clock=lambda: elapsed,
+        ) as client:
+            for _ in range(5):
+                client.get_recent_tracks("alice")
+
+        intervals = [
+            later - earlier
+            for earlier, later in zip(request_times, request_times[1:])
+        ]
+        self.assertEqual(len(request_times), 5)
+        self.assertTrue(all(interval >= MIN_REQUEST_INTERVAL for interval in intervals))
+
+    def test_throttling_is_shared_across_usernames(self) -> None:
+        elapsed = 0.0
+        request_times: list[float] = []
+
+        def sleep(delay: float) -> None:
+            nonlocal elapsed
+            elapsed += delay
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_times.append(elapsed)
+            return httpx.Response(200, json={"recenttracks": {}})
+
+        with LastFMClient(
+            "key",
+            transport=httpx.MockTransport(handler),
+            sleeper=sleep,
+            clock=lambda: elapsed,
+        ) as client:
+            for username in ("alice",) * 3 + ("bob",) * 3:
+                client.get_recent_tracks(username)
+
+        intervals = [
+            later - earlier
+            for earlier, later in zip(request_times, request_times[1:])
+        ]
+        self.assertEqual(len(request_times), 6)
+        self.assertTrue(all(interval >= MIN_REQUEST_INTERVAL for interval in intervals))
+
+    def test_retry_spacing_is_at_least_request_interval_or_backoff(self) -> None:
+        elapsed = 0.0
+        request_times: list[float] = []
+        attempts = 0
+
+        def sleep(delay: float) -> None:
+            nonlocal elapsed
+            elapsed += delay
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            request_times.append(elapsed)
+            if attempts == 1:
+                return httpx.Response(200, json={"error": 8, "message": "busy"})
+            return httpx.Response(200, json={"recenttracks": {}})
+
+        with LastFMClient(
+            "key",
+            retry_delay=0.8,
+            transport=httpx.MockTransport(handler),
+            sleeper=sleep,
+            clock=lambda: elapsed,
+        ) as client:
+            client.get_recent_tracks("alice")
+
+        self.assertEqual(len(request_times), 2)
+        self.assertGreaterEqual(
+            request_times[1] - request_times[0],
+            max(MIN_REQUEST_INTERVAL, 0.8),
+        )
+
+    def test_throttling_skips_sleep_when_clock_has_advanced_enough(self) -> None:
+        elapsed = 0.0
+        sleeps: list[float] = []
+
+        def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal elapsed
+            elapsed += MIN_REQUEST_INTERVAL
+            return httpx.Response(200, json={"recenttracks": {}})
+
+        with LastFMClient(
+            "key",
+            transport=httpx.MockTransport(handler),
+            sleeper=sleep,
+            clock=lambda: elapsed,
+        ) as client:
+            client.get_recent_tracks("alice")
+            client.get_recent_tracks("alice")
+
+        self.assertEqual(sleeps, [])
 
     def fail_if_called(self, delay: float) -> None:
         raise AssertionError("non-retryable errors must not invoke the sleeper")

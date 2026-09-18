@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
+from math import nextafter
 from typing import Any
 
 import httpx
@@ -13,6 +14,7 @@ import httpx
 LASTFM_ENDPOINT = "https://ws.audioscrobbler.com/2.0/"
 RETRYABLE_ERROR_CODES = frozenset({8, 11, 16, 29})
 DEFAULT_RETRY_DELAY = 0.4
+MIN_REQUEST_INTERVAL = 0.4
 
 
 class LastFMError(RuntimeError):
@@ -83,6 +85,7 @@ class LastFMClient:
         self._clock = clock
         self._retry_count = 0
         self._retry_causes: list[str] = []
+        self._last_request_started_at: float | None = None
         self.last_retrieval_stats = None
         self._client = httpx.Client(
             timeout=httpx.Timeout(
@@ -142,7 +145,15 @@ class LastFMClient:
         if to_timestamp is not None:
             params["to"] = to_timestamp
 
+        retry_delay = 0.0
         for attempt in range(self._max_retries + 1):
+            if retry_delay:
+                self._sleeper(retry_delay)
+                retry_delay = 0.0
+            else:
+                self._wait_for_request_start()
+            request_started_at = self._clock()
+            self._last_request_started_at = request_started_at
             try:
                 response = self._client.get(self._endpoint, params=params)
             except httpx.TimeoutException:
@@ -150,7 +161,11 @@ class LastFMClient:
                     raise
                 self._retry_count += 1
                 self._retry_causes.append("timeout")
-                self._sleeper(self._retry_delay_for(attempt))
+                retry_delay = self._retry_delay_for(attempt)
+                retry_delay = max(
+                    retry_delay,
+                    self._minimum_delay_after(request_started_at),
+                )
                 continue
 
             payload = self._decode_payload(response)
@@ -164,7 +179,11 @@ class LastFMClient:
                 raise error
             self._retry_count += 1
             self._retry_causes.append(f"api_error:{error.code}")
-            self._sleeper(self._retry_delay_for(attempt, response=response))
+            retry_delay = self._retry_delay_for(attempt, response=response)
+            retry_delay = max(
+                retry_delay,
+                self._minimum_delay_after(request_started_at),
+            )
 
         raise AssertionError("retry loop exhausted without returning or raising")
 
@@ -229,6 +248,22 @@ class LastFMClient:
         delay = retry_after if retry_after is not None else computed
         return max(DEFAULT_RETRY_DELAY, delay)
 
+    def _wait_for_request_start(self) -> None:
+        if self._last_request_started_at is None:
+            return
+        delay = self._minimum_delay_after(self._last_request_started_at)
+        if delay > 0:
+            self._sleeper(delay)
+
+    def _minimum_delay_after(self, request_started_at: float) -> float:
+        elapsed = self._clock() - request_started_at
+        if elapsed >= MIN_REQUEST_INTERVAL:
+            return 0.0
+        return max(
+            0.0,
+            nextafter(MIN_REQUEST_INTERVAL, float("inf")) - elapsed,
+        )
+
     @staticmethod
     def _decode_payload(response: httpx.Response) -> Mapping[str, Any]:
         try:
@@ -277,6 +312,7 @@ def _retry_after_seconds(
 __all__ = [
     "DEFAULT_RETRY_DELAY",
     "LASTFM_ENDPOINT",
+    "MIN_REQUEST_INTERVAL",
     "RETRYABLE_ERROR_CODES",
     "LastFMAPIError",
     "LastFMClient",
