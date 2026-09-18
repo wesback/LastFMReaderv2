@@ -105,7 +105,7 @@ def _total_pages(payload: Mapping[str, Any]) -> int:
         raise LastFMError(
             "Last.fm response contains an invalid totalPages value"
         ) from None
-    if total_pages < 1:
+    if total_pages < 0:
         raise LastFMError("Last.fm response contains an invalid totalPages value")
     return total_pages
 

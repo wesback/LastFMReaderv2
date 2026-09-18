@@ -3,8 +3,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
-from lastfm_export.client import LastFMClient, RecentTracksWindow
-from lastfm_export.retrieval import RecentTracksPaginator
+from lastfm_export.client import LastFMClient, LastFMError, RecentTracksWindow
+from lastfm_export.retrieval import RecentTracksPaginator, _total_pages
 
 
 def track(timestamp: int | None, *, now_playing: bool = False) -> dict[str, object]:
@@ -85,6 +85,50 @@ class RecentTracksPaginatorTests(unittest.TestCase):
             self.assertEqual(query["from"], ["100"])
             self.assertEqual(query["to"], ["200"])
             self.assertEqual(query["limit"], ["200"])
+
+    def test_zero_page_result_returns_empty_after_one_request(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "recenttracks": {
+                        "track": [],
+                        "@attr": {"totalPages": "0"},
+                    }
+                },
+            )
+
+        with LastFMClient(
+            "key",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            result = RecentTracksPaginator(client).fetch(
+                "alice",
+                window=RecentTracksWindow(100, 200),
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(len(requests), 1)
+        query = parse_qs(urlsplit(str(requests[0].url)).query)
+        self.assertEqual(query["page"], ["1"])
+
+    def test_invalid_total_pages_values_still_raise(self) -> None:
+        for value in (-1, "not-a-number", True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    LastFMError,
+                    "invalid totalPages value",
+                ):
+                    _total_pages(
+                        {
+                            "recenttracks": {
+                                "@attr": {"totalPages": value},
+                            }
+                        }
+                    )
 
     def test_date_less_and_out_of_window_tracks_are_discarded(self) -> None:
         requests: list[httpx.Request] = []
