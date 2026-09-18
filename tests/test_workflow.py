@@ -138,6 +138,100 @@ class FailingChunkLanding(FakeLanding):
 
 
 class FullResyncRunCoordinatorTests(unittest.TestCase):
+    def test_full_resync_initializes_watermark_from_epoch(self) -> None:
+        end = 1_609_459_200  # 2021-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                FakeLanding(),
+                clock=lambda: end,
+            ).run("alice", start=0, end=end)
+
+            self.assertEqual(store.get_last_successful_to("alice"), end)
+
+    def test_full_resync_advances_watermark_when_interval_covers_it(
+        self,
+    ) -> None:
+        start = 1_577_836_800  # 2020-01-01T00:00:00Z
+        end = 1_609_459_200  # 2021-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            store.record_successful_to("alice", start)
+
+            FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                FakeLanding(),
+                clock=lambda: end,
+            ).run("alice", start=start, end=end)
+
+            self.assertEqual(store.get_last_successful_to("alice"), end)
+
+    def test_full_resync_does_not_move_watermark_backwards(self) -> None:
+        start = 1_577_836_800  # 2020-01-01T00:00:00Z
+        end = 1_609_459_200  # 2021-01-01T00:00:00Z
+        watermark = 1_640_995_200  # 2022-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            store.record_successful_to("alice", watermark)
+
+            FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                FakeLanding(),
+                clock=lambda: end,
+            ).run("alice", start=start, end=end)
+
+            self.assertEqual(
+                store.get_last_successful_to("alice"),
+                watermark,
+            )
+
+    def test_full_resync_with_non_epoch_start_keeps_uninitialized_watermark(
+        self,
+    ) -> None:
+        start = 1_577_836_800  # 2020-01-01T00:00:00Z
+        end = 1_609_459_200  # 2021-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                FakeLanding(),
+                clock=lambda: end,
+            ).run("alice", start=start, end=end)
+
+            self.assertIsNone(store.get_last_successful_to("alice"))
+
+    def test_failed_full_resync_preserves_existing_watermark(self) -> None:
+        start = 1_577_836_800  # 2020-01-01T00:00:00Z
+        end = 1_672_531_200  # 2023-01-01T00:00:00Z
+        watermark = 1_609_459_200  # 2021-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            store.record_successful_to("alice", watermark)
+            coordinator = FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                FailingChunkLanding(),
+                clock=lambda: end,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "landing failed"):
+                coordinator.run("alice", start=start, end=end)
+
+            self.assertEqual(
+                store.get_last_successful_to("alice"),
+                watermark,
+            )
+
     def test_renews_lease_between_pages_and_chunks(self) -> None:
         interval = RecentTracksWindow(
             1_577_836_800,  # 2020-01-01T00:00:00Z

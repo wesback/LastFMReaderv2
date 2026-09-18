@@ -381,6 +381,50 @@ timezone = "UTC"
             self.assertEqual(record["retry_count"], 2)
             self.assertEqual(record["retry_causes"], ["timeout", "timeout"])
 
+    def test_full_resync_initializes_watermark_reported_by_status(self) -> None:
+        path = self.write_config(self.valid_config())
+        full_output = io.StringIO()
+        status_output = io.StringIO()
+        run_start = 1_609_459_200
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "bob",
+                    "--full-resync",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=full_output,
+                transport_factory=lambda _: FixtureExtraction(),
+                destination_writer_factory=lambda _: FixtureLanding(),
+                clock=lambda: run_start,
+            )
+            self.assertEqual(result, 0)
+
+            result = main(
+                [
+                    "status",
+                    "--config",
+                    str(path),
+                    "--state-dir",
+                    directory,
+                ],
+                output=status_output,
+            )
+
+        records = [
+            json.loads(line) for line in status_output.getvalue().splitlines()
+        ]
+        bob = next(record for record in records if record["username"] == "bob")
+        self.assertEqual(result, 0)
+        self.assertEqual(bob["status"], "initialized")
+        self.assertEqual(bob["last_successful_to"], run_start)
+
     def test_failed_retrieval_summary_keeps_observed_metrics(self) -> None:
         path = self.write_config(self.valid_config())
         output = io.StringIO()
