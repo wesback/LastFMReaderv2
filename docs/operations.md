@@ -4,6 +4,12 @@ The exporter is designed to be run by a scheduler. It does not send alerts
 itself. Operators can connect the scheduler's failure signal to the email,
 webhook, or platform alert receiver used by their deployment.
 
+For installation variants, secret handling, and a complete multi-user
+configuration, see [installation.md](installation.md) and
+[config.example.toml](config.example.toml). Scheduled deployments must inject
+`LASTFM_API_KEY` (or the variable named by `api_key_env`) and let the AWS or
+Azure filesystem adapter resolve cloud credentials through its native chain.
+
 ## Scheduler failure signal
 
 A completed exporter run is successful only when `lastfm-export` exits with
@@ -80,3 +86,35 @@ with the checkpoint watermark (`last_successful_to`) and
 `staleness_seconds`. Use those values to distinguish a failed current run
 from a user whose checkpoint has not yet been initialized, and to decide
 whether a retry or investigation is needed.
+
+## Retention and the Last.fm usage cap
+
+Last.fm's 100 MB point-in-time cap applies to the total stored Last.fm data
+across all tracked users, not to each user and not to lifetime transfer
+volume. Treat the cap as a hard operational ceiling: use Parquet as the
+default landing format, monitor the landing prefix size, and retain only files
+that have not yet been confirmed as merged downstream. After a consumer
+confirms a window is merged, delete that source landing file (or its
+corresponding partition) before the next export can push the aggregate above
+100 MB. Keep checkpoint state separately so pruning landing files does not
+reset extraction progress.
+
+## Fabric ADLS Gen2 shortcut handoff
+
+For a Fabric deployment, configure the export destination as an ADLS Gen2
+filesystem URI and create a Fabric ADLS Gen2 shortcut to that landing
+location. The exporter writes deterministic raw landing windows and replaces
+the existing final file atomically when the same window is rerun; the
+shortcut is the consumer's access path and requires no OneLake-specific code
+in the exporter.
+
+The shortcut handoff ends at the raw landing boundary. The downstream consumer,
+not this exporter, owns:
+
+- merging and deduplicating landing windows into its target data;
+- defining the curated presentation schema, views, or tables; and
+- processing deletion diffs during reconciliation by comparing the current
+  source key set with the consumer's prior state.
+
+Do not delete a landing window until that consumer has completed the merge and
+any required deletion-diff processing.
