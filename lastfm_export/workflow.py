@@ -351,6 +351,7 @@ class FullResyncRunCoordinator(Generic[Extracted]):
 
         try:
             lease = self._renew_lease(lease)
+            checkpoint = self._checkpoint_store.get_last_successful_to(username)
             completed_at = self._checkpoint_store.get_last_full_resync_at(
                 username
             )
@@ -399,6 +400,16 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                     lease=lease,
                 )
                 committed.add(chunk)
+            if _full_resync_advances_watermark(
+                checkpoint,
+                interval=interval,
+            ):
+                lease = self._renew_lease(lease)
+                self._checkpoint_store.record_successful_to(
+                    username,
+                    interval.to_timestamp,
+                    lease=lease,
+                )
             lease = self._renew_lease(lease)
             self._checkpoint_store.record_full_resync_completed(
                 username,
@@ -509,6 +520,18 @@ def _incremental_start(
     if checkpoint is None:
         return 0
     return max(0, checkpoint - overlap_seconds)
+
+
+def _full_resync_advances_watermark(
+    checkpoint: int | None,
+    *,
+    interval: RecentTracksWindow,
+) -> bool:
+    """Return whether a completed full interval closes the watermark gap."""
+    start, end = _bounded_window(interval, name="full-resync interval")
+    if checkpoint is None:
+        return start == 0
+    return start <= checkpoint < end
 
 
 def _window(*, start: int, end: int) -> RecentTracksWindow:
