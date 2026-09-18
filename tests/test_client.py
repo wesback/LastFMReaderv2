@@ -121,6 +121,203 @@ class LastFMClientTests(unittest.TestCase):
         self.assertEqual(attempts, 3)
         self.assertEqual(delays, [0.4, 0.8])
 
+    def test_transport_errors_retry_with_transport_cause(self) -> None:
+        for error_type in (
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+        ):
+            with self.subTest(error_type=error_type.__name__):
+                attempts = 0
+                delays: list[float] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts < 3:
+                        raise error_type("transient transport failure", request=request)
+                    return httpx.Response(200, json={"recenttracks": {}})
+
+                with LastFMClient(
+                    "key",
+                    max_retries=2,
+                    transport=httpx.MockTransport(handler),
+                    sleeper=delays.append,
+                ) as client:
+                    client.get_recent_tracks("alice")
+
+                    self.assertEqual(client.retry_count, 2)
+                    self.assertEqual(
+                        client.retry_causes,
+                        ("transport", "transport"),
+                    )
+
+                self.assertEqual(attempts, 3)
+                self.assertEqual(delays, [0.4, 0.8])
+
+    def test_transport_error_raises_last_error_after_retry_budget(self) -> None:
+        attempts = 0
+        errors: list[httpx.TransportError] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            error = httpx.ConnectError(f"failure {attempts}", request=request)
+            errors.append(error)
+            raise error
+
+        with LastFMClient(
+            "key",
+            max_retries=2,
+            transport=httpx.MockTransport(handler),
+            sleeper=lambda _: None,
+        ) as client:
+            with self.assertRaises(httpx.ConnectError) as raised:
+                client.get_recent_tracks("alice")
+
+            self.assertEqual(client.retry_count, 2)
+            self.assertEqual(client.retry_causes, ("transport", "transport"))
+
+        self.assertIs(raised.exception, errors[-1])
+        self.assertEqual(attempts, 3)
+
+    def test_non_json_gateway_responses_retry_with_status_cause(self) -> None:
+        for status_code in (500, 502, 503, 504):
+            with self.subTest(status_code=status_code):
+                attempts = 0
+                delays: list[float] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        return httpx.Response(
+                            status_code,
+                            text="gateway failure",
+                        )
+                    return httpx.Response(200, json={"recenttracks": {}})
+
+                with LastFMClient(
+                    "key",
+                    transport=httpx.MockTransport(handler),
+                    sleeper=delays.append,
+                ) as client:
+                    client.get_recent_tracks("alice")
+
+                    self.assertEqual(client.retry_count, 1)
+                    self.assertEqual(
+                        client.retry_causes,
+                        (f"http_status:{status_code}",),
+                    )
+
+                self.assertEqual(attempts, 2)
+                self.assertEqual(delays, [0.4])
+
+    def test_non_json_gateway_response_honors_retry_after(self) -> None:
+        attempts = 0
+        delays: list[float] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(
+                    503,
+                    headers={"Retry-After": "2.75"},
+                    text="gateway failure",
+                )
+            return httpx.Response(200, json={"recenttracks": {}})
+
+        with LastFMClient(
+            "key",
+            transport=httpx.MockTransport(handler),
+            sleeper=delays.append,
+        ) as client:
+            client.get_recent_tracks("alice")
+
+        self.assertEqual(delays, [2.75])
+
+    def test_non_json_gateway_response_raises_last_status_error_after_retry_budget(
+        self,
+    ) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(503, text=f"gateway failure {attempts}")
+
+        with LastFMClient(
+            "key",
+            max_retries=2,
+            transport=httpx.MockTransport(handler),
+            sleeper=lambda _: None,
+        ) as client:
+            with self.assertRaises(httpx.HTTPStatusError) as raised:
+                client.get_recent_tracks("alice")
+
+            self.assertEqual(client.retry_count, 2)
+            self.assertEqual(
+                client.retry_causes,
+                ("http_status:503", "http_status:503"),
+            )
+
+        self.assertEqual(raised.exception.response.status_code, 503)
+        self.assertEqual(raised.exception.response.text, "gateway failure 3")
+        self.assertEqual(attempts, 3)
+
+    def test_fifthxx_json_api_errors_keep_api_error_retry_behavior(self) -> None:
+        for code, should_retry in ((8, True), (10, False)):
+            with self.subTest(code=code):
+                attempts = 0
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    attempts += 1
+                    return httpx.Response(
+                        503,
+                        json={"error": code, "message": "backend failure"},
+                    )
+
+                with LastFMClient(
+                    "key",
+                    max_retries=1,
+                    transport=httpx.MockTransport(handler),
+                    sleeper=self.fail_if_called if not should_retry else lambda _: None,
+                ) as client:
+                    with self.assertRaises(LastFMAPIError) as raised:
+                        client.get_recent_tracks("alice")
+
+                    expected_attempts = 2 if should_retry else 1
+                    self.assertEqual(attempts, expected_attempts)
+                    self.assertEqual(
+                        client.retry_count,
+                        1 if should_retry else 0,
+                    )
+
+                self.assertEqual(raised.exception.code, code)
+
+    def test_non_json_client_error_responses_are_not_retried(self) -> None:
+        for status_code in (400, 403, 404):
+            with self.subTest(status_code=status_code):
+                attempts = 0
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    attempts += 1
+                    return httpx.Response(status_code, text="client failure")
+
+                with LastFMClient(
+                    "key",
+                    transport=httpx.MockTransport(handler),
+                    sleeper=self.fail_if_called,
+                ) as client:
+                    with self.assertRaises(httpx.HTTPStatusError) as raised:
+                        client.get_recent_tracks("alice")
+
+                self.assertEqual(raised.exception.response.status_code, status_code)
+                self.assertEqual(attempts, 1)
+
     def test_non_retryable_api_errors_raise_without_retry(self) -> None:
         for code in (10, 26):
             with self.subTest(code=code):
