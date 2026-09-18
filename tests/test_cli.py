@@ -1,4 +1,5 @@
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,6 +159,73 @@ timezone = "UTC"
             )
 
         self.assertEqual(captured[0].selected_users, ("bob",))
+
+    def test_status_reports_checkpoint_watermark_and_staleness_as_jsonl(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        checkpoint_store = FakeCheckpointStore({"alice": 1_700_000_000, "bob": 1_700_086_400})
+        transport = Mock()
+        writer = Mock()
+
+        result = main(
+            ["status", "--config", str(path)],
+            environ={"LASTFM_TEST_API_KEY": "test-key"},
+            output=output,
+            checkpoint_store=checkpoint_store,
+            clock=lambda: 1_700_172_800,
+            transport_factory=transport,
+            destination_writer_factory=writer,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [json.loads(line) for line in output.getvalue().splitlines()],
+            [
+                {
+                    "username": "alice",
+                    "last_successful_to": 1_700_000_000,
+                    "status": "initialized",
+                    "staleness_seconds": 172800,
+                },
+                {
+                    "username": "bob",
+                    "last_successful_to": 1_700_086_400,
+                    "status": "initialized",
+                    "staleness_seconds": 86400,
+                },
+            ],
+        )
+        self.assertEqual(checkpoint_store.read_users, ["alice", "bob"])
+        transport.assert_not_called()
+        writer.assert_not_called()
+
+    def test_status_reports_uninitialized_user_without_checkpoint(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+
+        result = main(
+            ["status", "--config", str(path)],
+            output=output,
+            checkpoint_store=FakeCheckpointStore({"alice": 1_700_000_000}),
+            clock=lambda: 1_700_172_800,
+        )
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(result, 0)
+        self.assertEqual(records[1]["username"], "bob")
+        self.assertIsNone(records[1]["last_successful_to"])
+        self.assertIsNone(records[1]["staleness_seconds"])
+        self.assertEqual(records[1]["status"], "uninitialized")
+
+
+class FakeCheckpointStore:
+    def __init__(self, checkpoints: dict[str, int]) -> None:
+        self.checkpoints = checkpoints
+        self.read_users: list[str] = []
+
+    def get_last_successful_to(self, username: str) -> int | None:
+        self.read_users.append(username)
+        return self.checkpoints.get(username)
 
 
 if __name__ == "__main__":
