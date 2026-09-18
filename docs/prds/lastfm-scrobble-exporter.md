@@ -154,7 +154,7 @@ The row schema above is what lands in the raw extraction files, wide and technic
 
 **Packaging**
 
-- `pyproject.toml` with `hatchling`, a console-script entry point, so the install-to-run path is `pip install lastfm-export` then `lastfm-export <username>`
+- `pyproject.toml` with `hatchling`, a console-script entry point. The package is installed via `pip install -e .` from a checked-out copy of the repository; it is not currently published to public PyPI. The install-to-run path is then `lastfm-export <username>`
 - Cloud-specific dependencies (`s3fs`+`boto3`, `adlfs`+`azure-identity`) as optional extras (`[aws]`, `[azure]`), not forced on every installer
 - An optional Docker image (`python:3.12-slim`, non-root user) for unattended, scheduled runs. This is a second interface for automation, not a replacement for the pip-installable CLI, which stays the lowest-friction path for a one-off export
 

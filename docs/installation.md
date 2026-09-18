@@ -2,23 +2,24 @@
 
 ## Install the exporter
 
-Install the core package when writing to local storage or a destination whose
-filesystem adapter is already available:
+Clone or check out the repository, then install the core package in editable
+mode when writing to local storage or a destination whose filesystem adapter
+is already available:
 
 ```console
-python -m pip install lastfm-export
+python3 -m pip install -e .
 ```
 
 Install the AWS extra for S3 destinations:
 
 ```console
-python -m pip install 'lastfm-export[aws]'
+python3 -m pip install -e '.[aws]'
 ```
 
 Install the Azure extra for Azure Blob Storage or ADLS Gen2 destinations:
 
 ```console
-python -m pip install 'lastfm-export[azure]'
+python3 -m pip install -e '.[azure]'
 ```
 
 The extras are optional. The core package contains the exporter and local
