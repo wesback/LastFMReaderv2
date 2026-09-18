@@ -96,6 +96,125 @@ reconciliation_cadence = 30
         ):
             load_config(path, environ={"LASTFM_TEST_API_KEY": "secret-value"})
 
+    def test_invalid_format_is_rejected_during_load(self) -> None:
+        path = self.write_config(
+            self.valid_config().replace('format = "parquet"', 'format = "parqet"')
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "format"):
+            load_config(path, environ={"LASTFM_TEST_API_KEY": "secret-value"})
+
+    def test_supported_formats_are_accepted_case_insensitively(self) -> None:
+        for format_name in ("PARQUET", "CSV", "JSONL", "JSON", "JSON_LINES", "NDJSON"):
+            with self.subTest(format=format_name):
+                path = self.write_config(
+                    self.valid_config().replace(
+                        'format = "parquet"',
+                        f'format = "{format_name}"',
+                    )
+                )
+
+                config = load_config(
+                    path,
+                    environ={"LASTFM_TEST_API_KEY": "secret-value"},
+                )
+
+                self.assertEqual(config.format, format_name)
+
+    def test_unsupported_global_destination_scheme_is_rejected_during_load(
+        self,
+    ) -> None:
+        path = self.write_config(
+            self.valid_config().replace(
+                'destination = "file:///exports"',
+                'destination = "gs://bucket/exports"',
+            )
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "destination"):
+            load_config(path, environ={"LASTFM_TEST_API_KEY": "secret-value"})
+
+    def test_scheme_less_local_destination_is_accepted(self) -> None:
+        path = self.write_config(
+            self.valid_config().replace(
+                'destination = "file:///exports"',
+                'destination = "/tmp/exports"',
+            )
+        )
+
+        config = load_config(path, environ={"LASTFM_TEST_API_KEY": "secret-value"})
+
+        self.assertEqual(config.destination, "/tmp/exports")
+        self.assertEqual(config.user("alice").destination, "/tmp/exports")
+
+    def test_unsupported_per_user_destination_scheme_is_rejected_during_load(
+        self,
+    ) -> None:
+        path = self.write_config(
+            self.valid_config(
+                'username = "alice"\ndestination = "gs://bucket/alice"'
+            )
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "destination"):
+            load_config(path, environ={"LASTFM_TEST_API_KEY": "secret-value"})
+
+    def test_malformed_destination_uri_is_rejected_during_load(self) -> None:
+        path = self.write_config(
+            self.valid_config().replace(
+                'destination = "file:///exports"',
+                'destination = "file://[malformed"',
+            )
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "destination"):
+            load_config(path, environ={"LASTFM_TEST_API_KEY": "secret-value"})
+
+    def test_string_numeric_settings_are_normalized(self) -> None:
+        path = self.write_config(
+            self.valid_config()
+            .replace("overlap = 7", 'overlap = "7"')
+            .replace("reconciliation_cadence = 30", 'reconciliation_cadence = "1.5"')
+        )
+
+        config = load_config(path, environ={"LASTFM_TEST_API_KEY": "secret-value"})
+
+        self.assertEqual(config.overlap, 7)
+        self.assertEqual(config.reconciliation_cadence, 1.5)
+
+    def test_non_numeric_setting_string_is_rejected(self) -> None:
+        for field in ("overlap", "reconciliation_cadence"):
+            with self.subTest(field=field):
+                path = self.write_config(
+                    self.valid_config().replace(
+                        f"{field} = {'7' if field == 'overlap' else '30'}",
+                        f'{field} = "seven"',
+                    )
+                )
+
+                with self.assertRaisesRegex(ConfigurationError, field):
+                    load_config(
+                        path,
+                        environ={"LASTFM_TEST_API_KEY": "secret-value"},
+                    )
+
+    def test_boolean_numeric_settings_are_rejected(self) -> None:
+        for field in ("overlap", "reconciliation_cadence"):
+            for boolean_literal in ("true", "false"):
+                with self.subTest(field=field, boolean_literal=boolean_literal):
+                    path = self.write_config(
+                        self.valid_config().replace(
+                            f"{field} = {'7' if field == 'overlap' else '30'}",
+                            f"{field} = {boolean_literal}",
+                        )
+                    )
+
+                    with self.assertRaisesRegex(ConfigurationError, field):
+                        load_config(
+                            path,
+                            environ={"LASTFM_TEST_API_KEY": "secret-value"},
+                        )
+
     def test_invalid_timezone_identifies_user_field(self) -> None:
         path = self.write_config(
             self.valid_config('username = "alice"\ntimezone = "Mars/Olympus"')

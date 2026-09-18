@@ -6,13 +6,21 @@ import os
 import tomllib
 import warnings
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ConfigurationError(ValueError):
     """Raised when an exporter configuration cannot be loaded or validated."""
+
+
+_SUPPORTED_FORMATS = frozenset(
+    {"parquet", "csv", "jsonl", "json", "json_lines", "ndjson"}
+)
+_SUPPORTED_DESTINATION_SCHEMES = frozenset({"file", "s3", "az", "abfss"})
 
 
 @dataclass(frozen=True)
@@ -46,8 +54,8 @@ class ExporterConfig:
     api_key_env: str
     format: str
     destination: str
-    overlap: int | float | str
-    reconciliation_cadence: int | float | str
+    overlap: int | float
+    reconciliation_cadence: int | float
     users: tuple[UserConfig, ...]
 
     @property
@@ -111,18 +119,14 @@ def load_config(
     global_values = _global_values(document)
     api_key_env = _required_string(global_values, "api_key_env")
     format_name = _required_string(global_values, "format")
+    _validate_format(format_name)
     destination = _required_string(global_values, "destination")
+    _validate_destination(destination)
     overlap = _required_setting(global_values, "overlap")
     reconciliation_cadence = _required_setting(
         global_values,
         "reconciliation_cadence",
     )
-
-    environment = os.environ if environ is None else environ
-    if require_api_key and not environment.get(api_key_env):
-        raise ConfigurationError(
-            f"API-key environment variable {api_key_env!r} is unset"
-        )
 
     records = _user_records(document)
     if not records:
@@ -147,6 +151,10 @@ def load_config(
             raise ConfigurationError(
                 f"users[{index}].destination must be a non-empty string"
             )
+        _validate_destination(
+            user_destination,
+            field_name=f"users[{index}].destination",
+        )
 
         timezone_name = record.get("timezone", record.get("time_zone"))
         if timezone_name is None:
@@ -175,6 +183,12 @@ def load_config(
                 destination=user_destination,
                 timezone=user_zone,
             )
+        )
+
+    environment = os.environ if environ is None else environ
+    if require_api_key and not environment.get(api_key_env):
+        raise ConfigurationError(
+            f"API-key environment variable {api_key_env!r} is unset"
         )
 
     config = ExporterConfig(
@@ -254,7 +268,7 @@ def _required_string(
     return value
 
 
-def _required_setting(values: dict[str, Any], field: str) -> int | float | str:
+def _required_setting(values: dict[str, Any], field: str) -> int | float:
     if field not in values:
         raise ConfigurationError(f"missing required configuration field '{field}'")
     value = values[field]
@@ -264,11 +278,59 @@ def _required_setting(values: dict[str, Any], field: str) -> int | float | str:
         )
     if isinstance(value, str) and not value.strip():
         raise ConfigurationError(f"configuration field '{field}' must not be empty")
-    if isinstance(value, (int, float)) and value < 0:
+    if isinstance(value, str):
+        try:
+            numeric_value = float(value.strip())
+        except ValueError:
+            raise ConfigurationError(
+                f"configuration field '{field}' must be a finite non-negative number"
+            ) from None
+        if not isfinite(numeric_value) or numeric_value < 0:
+            raise ConfigurationError(
+                f"configuration field '{field}' must be a finite non-negative number"
+            )
+        return (
+            int(numeric_value)
+            if numeric_value.is_integer()
+            else numeric_value
+        )
+    if isinstance(value, float) and not isfinite(value):
+        raise ConfigurationError(
+            f"configuration field '{field}' must be a finite non-negative number"
+        )
+    if value < 0:
         raise ConfigurationError(
             f"configuration field '{field}' must not be negative"
         )
     return value
+
+
+def _validate_format(value: str) -> None:
+    normalized = value.casefold().replace("-", "_").replace(" ", "_")
+    if normalized not in _SUPPORTED_FORMATS:
+        supported = ", ".join(sorted(_SUPPORTED_FORMATS))
+        raise ConfigurationError(
+            f"configuration field 'format' must be one of {supported}"
+        )
+
+
+def _validate_destination(
+    value: str,
+    *,
+    field_name: str = "destination",
+) -> None:
+    try:
+        scheme = urlsplit(value).scheme.casefold()
+    except ValueError as error:
+        raise ConfigurationError(
+            f"configuration field '{field_name}' is not a valid destination URI"
+        ) from error
+    if scheme and scheme not in _SUPPORTED_DESTINATION_SCHEMES:
+        supported = ", ".join(sorted(_SUPPORTED_DESTINATION_SCHEMES))
+        raise ConfigurationError(
+            f"configuration field '{field_name}' has unsupported destination "
+            f"scheme {scheme!r}; expected one of {supported} or a local path"
+        )
 
 
 __all__ = [

@@ -10,6 +10,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol, TextIO
 
@@ -129,6 +130,18 @@ def build_run_request(
     environ: Mapping[str, str] | None = None,
 ) -> RunRequest:
     """Build the integration-facing request from parsed CLI options."""
+    since = None
+    if arguments.since is not None:
+        since = arguments.since.strip()
+        if since.endswith("Z"):
+            since = f"{since[:-1]}+00:00"
+        try:
+            datetime.fromisoformat(since)
+        except ValueError as error:
+            raise ConfigurationError(
+                "--since must be an ISO-8601 timestamp"
+            ) from error
+
     option_user = arguments.selected_user
     positional_user = arguments.user
     if (
@@ -160,7 +173,7 @@ def build_run_request(
     return RunRequest(
         config=config,
         selected_users=selected_users,
-        since=arguments.since,
+        since=since,
         dry_run=arguments.dry_run,
         full_resync=arguments.full_resync,
         config_path=Path(config_path),
