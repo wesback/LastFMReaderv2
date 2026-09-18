@@ -20,7 +20,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install build backend
-        run: python -m pip install --disable-pip-version-check hatchling
+      - name: Install project and runtime dependencies
+        run: python -m pip install --disable-pip-version-check .
       - name: Run tests
         run: python -m tests.runner
