@@ -10,11 +10,24 @@ from .client import LastFMClient, LastFMError, RecentTracksWindow
 Track = Mapping[str, Any]
 
 
+class RetrievalStats:
+    """Counters collected while reading one bounded window."""
+
+    def __init__(
+        self,
+        pages_fetched: int = 0,
+        rows_skipped_now_playing: int = 0,
+    ) -> None:
+        self.pages_fetched = pages_fetched
+        self.rows_skipped_now_playing = rows_skipped_now_playing
+
+
 class RecentTracksPaginator:
     """Retrieve all dated tracks in a caller-supplied fixed time window."""
 
     def __init__(self, client: LastFMClient) -> None:
         self._client = client
+        self.stats = RetrievalStats()
 
     def fetch(
         self,
@@ -29,22 +42,32 @@ class RecentTracksPaginator:
         a fixed first-page boundary keeps a run bounded and repeatable.
         """
         _validate_bounded_window(window)
-        first_page = self._client.get_recent_tracks(
-            username,
-            window=window,
-            page=1,
-        )
-        total_pages = _total_pages(first_page)
-        tracks = _dated_tracks(first_page, window)
-
-        for page in range(2, total_pages + 1):
-            response = self._client.get_recent_tracks(
+        pages_fetched = 0
+        rows_skipped_now_playing = 0
+        try:
+            first_page = self._client.get_recent_tracks(
                 username,
                 window=window,
-                page=page,
+                page=1,
             )
-            tracks.extend(_dated_tracks(response, window))
-        return tracks
+            pages_fetched += 1
+            total_pages = _total_pages(first_page)
+            tracks, skipped = _dated_tracks(first_page, window)
+            rows_skipped_now_playing += skipped
+
+            for page in range(2, total_pages + 1):
+                response = self._client.get_recent_tracks(
+                    username,
+                    window=window,
+                    page=page,
+                )
+                pages_fetched += 1
+                page_tracks, skipped = _dated_tracks(response, window)
+                tracks.extend(page_tracks)
+                rows_skipped_now_playing += skipped
+            return tracks
+        finally:
+            self.stats = RetrievalStats(pages_fetched, rows_skipped_now_playing)
 
 
 def retrieve_scrobbles(
@@ -90,7 +113,7 @@ def _total_pages(payload: Mapping[str, Any]) -> int:
 def _dated_tracks(
     payload: Mapping[str, Any],
     window: RecentTracksWindow,
-) -> list[Track]:
+) -> tuple[list[Track], int]:
     recent_tracks = payload.get("recenttracks")
     if not isinstance(recent_tracks, Mapping):
         raise LastFMError("Last.fm response is missing recenttracks")
@@ -105,11 +128,13 @@ def _dated_tracks(
     assert window.from_timestamp is not None
     assert window.to_timestamp is not None
     dated: list[Track] = []
+    skipped_now_playing = 0
     for track in candidates:
         if not isinstance(track, Mapping):
             raise LastFMError("Last.fm response contains an invalid track")
         date = track.get("date")
         if date is None:
+            skipped_now_playing += 1
             continue
         if not isinstance(date, Mapping):
             raise LastFMError("Last.fm response contains an invalid track date")
@@ -124,7 +149,7 @@ def _dated_tracks(
             ) from None
         if window.from_timestamp <= timestamp < window.to_timestamp:
             dated.append(track)
-    return dated
+    return dated, skipped_now_playing
 
 
-__all__ = ["RecentTracksPaginator", "Track", "retrieve_scrobbles"]
+__all__ = ["RecentTracksPaginator", "RetrievalStats", "Track", "retrieve_scrobbles"]
