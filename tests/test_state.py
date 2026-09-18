@@ -21,7 +21,7 @@ class CheckpointStoreTests(unittest.TestCase):
     def test_leases_are_exclusive_per_user_and_expire(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CheckpointStore(Path(directory))
-            alice_lease = store.acquire_lease("alice", ttl_seconds=0.05)
+            alice_lease = store.acquire_lease("alice", ttl_seconds=5)
             reopened = CheckpointStore(Path(directory))
 
             self.assertIsNotNone(alice_lease)
