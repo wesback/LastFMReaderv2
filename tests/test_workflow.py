@@ -36,6 +36,25 @@ class FakeExtraction:
         return ["extracted"]
 
 
+class FailingOnceExtraction(FakeExtraction):
+    def __init__(self, failed_from: int) -> None:
+        super().__init__()
+        self.failed_from = failed_from
+        self.failed = False
+
+    def extract(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[str]:
+        records = super().extract(username, window=window)
+        if window.from_timestamp == self.failed_from and not self.failed:
+            self.failed = True
+            raise RuntimeError("extraction failed")
+        return records
+
+
 class PagingExtraction:
     def __init__(
         self,
@@ -271,6 +290,101 @@ class FullResyncRunCoordinatorTests(unittest.TestCase):
                 )
 
             self.assertIsNotNone(store.acquire_lease("alice", ttl_seconds=1))
+
+    def test_resume_matches_closed_chunks_when_run_end_changes(self) -> None:
+        start = 1_514_764_800  # 2018-01-01T00:00:00Z
+        first_end = 1_700_000_000
+        second_end = 1_700_000_100
+        failed_from = 1_577_836_800  # 2020-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            extraction = FailingOnceExtraction(failed_from)
+            coordinator = FullResyncRunCoordinator(
+                store,
+                extraction,
+                FakeLanding(),
+                clock=lambda: second_end,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "extraction failed"):
+                coordinator.run("alice", start=start, end=first_end)
+
+            coordinator.run("alice", start=start, end=second_end)
+
+            self.assertEqual(
+                [window for _, window in extraction.calls[3:]],
+                [
+                    RecentTracksWindow(failed_from, 1_609_459_200),
+                    RecentTracksWindow(1_609_459_200, 1_640_995_200),
+                    RecentTracksWindow(1_640_995_200, 1_672_531_200),
+                    RecentTracksWindow(1_672_531_200, second_end),
+                ],
+            )
+
+    def test_completed_full_resync_starts_a_fresh_reconciliation(self) -> None:
+        start = 1_514_764_800  # 2018-01-01T00:00:00Z
+        first_end = 1_700_000_000
+        second_end = 1_700_000_100
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            first_extraction = FakeExtraction()
+            FullResyncRunCoordinator(
+                store,
+                first_extraction,
+                FakeLanding(),
+                clock=lambda: first_end,
+            ).run("alice", start=start, end=first_end)
+
+            second_extraction = FakeExtraction()
+            FullResyncRunCoordinator(
+                store,
+                second_extraction,
+                FakeLanding(),
+                clock=lambda: second_end,
+            ).run("alice", start=start, end=second_end)
+
+            self.assertEqual(
+                [window for _, window in second_extraction.calls],
+                list(
+                    calendar_year_chunks(
+                        RecentTracksWindow(start, second_end)
+                    )
+                ),
+            )
+
+    def test_changed_start_only_reuses_exact_chunk_bounds(self) -> None:
+        first_start = 1_514_764_800  # 2018-01-01T00:00:00Z
+        second_start = 1_546_300_800  # 2019-01-01T00:00:00Z
+        first_end = 1_700_000_000
+        second_end = 1_700_000_100
+        failed_from = 1_577_836_800  # 2020-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            extraction = FailingOnceExtraction(failed_from)
+            coordinator = FullResyncRunCoordinator(
+                store,
+                extraction,
+                FakeLanding(),
+                clock=lambda: second_end,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "extraction failed"):
+                coordinator.run("alice", start=first_start, end=first_end)
+
+            coordinator.run("alice", start=second_start, end=second_end)
+
+            self.assertEqual(
+                [window for _, window in extraction.calls[3:]],
+                [
+                    RecentTracksWindow(failed_from, 1_609_459_200),
+                    RecentTracksWindow(1_609_459_200, 1_640_995_200),
+                    RecentTracksWindow(1_640_995_200, 1_672_531_200),
+                    RecentTracksWindow(1_672_531_200, second_end),
+                ],
+            )
 
 
 class ReconciliationSelectionTests(unittest.TestCase):
