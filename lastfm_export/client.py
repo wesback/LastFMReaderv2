@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 LASTFM_ENDPOINT = "https://ws.audioscrobbler.com/2.0/"
-RETRYABLE_ERROR_CODES = frozenset({11, 16, 29})
+RETRYABLE_ERROR_CODES = frozenset({8, 11, 16, 29})
 DEFAULT_RETRY_DELAY = 0.4
 
 
