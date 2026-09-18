@@ -92,6 +92,35 @@ class TitleEnrichmentTests(unittest.TestCase):
                 self.assertEqual(result.featured_artists, ["Guest Artist"])
                 self.assertEqual(result.track_title_clean, "Song")
 
+    def test_extracts_parenthesized_and_bracketed_trailing_credits(self) -> None:
+        cases = (
+            ("Lean On (feat. MØ & DJ Snake)", "Lean On", ["MØ & DJ Snake"]),
+            (
+                "Get Lucky [feat. Pharrell Williams]",
+                "Get Lucky",
+                ["Pharrell Williams"],
+            ),
+            ("Song (ft. Artist)", "Song", ["Artist"]),
+            ("Song (featuring Artist)", "Song", ["Artist"]),
+            ("Song (FEAT. Artist)", "Song", ["Artist"]),
+            ("Song (feat. Artist) (Live)", "Song", ["Artist"]),
+            ("Song (Live) [feat. Artist]", "Song", ["Artist"]),
+            ("Song (feat. Artist) - 2011 Remaster", "Song", ["Artist"]),
+            (
+                "Bad Guy (with Justin Bieber)",
+                "Bad Guy (with Justin Bieber)",
+                None,
+            ),
+            ("Song (feat.)", "Song (feat.)", None),
+        )
+
+        for track, expected_title, expected_artists in cases:
+            with self.subTest(track=track):
+                result = enrich_title(track)
+                self.assertEqual(result.track, track)
+                self.assertEqual(result.track_title_clean, expected_title)
+                self.assertEqual(result.featured_artists, expected_artists)
+
     def test_returns_null_credit_and_preserves_source_track_without_credit(self) -> None:
         track = "SONG (LIVE)"
 
