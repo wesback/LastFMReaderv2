@@ -46,7 +46,7 @@ class LastFMClientTests(unittest.TestCase):
         self.assertEqual(timeout["read"], 7.5)
 
     def test_retryable_api_errors_retry_with_exponential_delays(self) -> None:
-        for code in (11, 16, 29):
+        for code in (8, 11, 16, 29):
             with self.subTest(code=code):
                 attempts = 0
                 delays: list[float] = []
@@ -70,6 +70,34 @@ class LastFMClientTests(unittest.TestCase):
 
                 self.assertEqual(attempts, 3)
                 self.assertEqual(delays, [0.4, 0.8])
+
+    def test_api_error_8_retries_until_budget_is_exhausted(self) -> None:
+        attempts = 0
+        delays: list[float] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(
+                200,
+                json={"error": 8, "message": "backend failure"},
+            )
+
+        with LastFMClient(
+            "key",
+            max_retries=2,
+            transport=httpx.MockTransport(handler),
+            sleeper=delays.append,
+        ) as client:
+            with self.assertRaises(LastFMAPIError) as raised:
+                client.get_recent_tracks("alice")
+
+            self.assertEqual(client.retry_count, 2)
+            self.assertEqual(client.retry_causes, ("api_error:8", "api_error:8"))
+
+        self.assertEqual(raised.exception.code, 8)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(delays, [0.4, 0.8])
 
     def test_timeout_retries_and_raises_after_retry_budget(self) -> None:
         attempts = 0
