@@ -1,9 +1,12 @@
-"""Local landing-file serialization for normalized Last.fm records."""
+"""Landing-file serialization for normalized Last.fm records."""
 
 from __future__ import annotations
 
 import os
+import posixpath
+import shutil
 import tempfile
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import fields
 from datetime import datetime, timezone
@@ -92,6 +95,100 @@ class LocalLandingWriter:
             raise ValueError(f"unsupported landing format: {format!r}")
 
 
+class FsspecLandingWriter:
+    """Write landing files through an fsspec filesystem."""
+
+    _SUPPORTED_SCHEMES = frozenset({"file", "s3", "az", "abfss"})
+
+    def __init__(self, destination: str, format: str = "parquet") -> None:
+        if not isinstance(destination, str) or not destination:
+            raise ValueError("destination must be a non-empty URI")
+        parsed = urlsplit(destination)
+        if parsed.scheme not in self._SUPPORTED_SCHEMES:
+            supported = ", ".join(sorted(self._SUPPORTED_SCHEMES))
+            raise ValueError(
+                f"unsupported destination URI scheme {parsed.scheme!r}; "
+                f"expected one of {supported}"
+            )
+
+        import fsspec
+
+        self.destination = destination
+        self._filesystem, self._root = fsspec.core.url_to_fs(destination)
+        self.format = _format_name(format)
+
+    def path(
+        self,
+        username: str,
+        window: RecentTracksWindow | Sequence[int],
+        *,
+        format: str | None = None,
+    ) -> str:
+        """Return the deterministic URI for a username and window."""
+        from_timestamp, to_timestamp = _window_bounds(window)
+        _validate_username(username)
+        output_format = self.format if format is None else _format_name(format)
+        relative = _landing_relative_path(
+            username,
+            from_timestamp,
+            to_timestamp,
+            output_format,
+        )
+        return _join_uri(self.destination, relative)
+
+    def write(
+        self,
+        username: str,
+        window: RecentTracksWindow | Sequence[int],
+        rows: NormalizedRows,
+        *,
+        format: str | None = None,
+    ) -> str:
+        """Serialize and atomically publish a deterministic fsspec key."""
+        final_uri = self.path(username, window, format=format)
+        output_format = self.format if format is None else _format_name(format)
+        from_timestamp, to_timestamp = _window_bounds(window)
+        relative = _landing_relative_path(
+            username,
+            from_timestamp,
+            to_timestamp,
+            output_format,
+        )
+        records = [_record_as_dict(row) for row in rows]
+        frame = _polars_frame(records)
+        root = str(self._root).rstrip("/")
+        final_path = posixpath.join(root, relative) if root else relative
+        temporary_path = _temporary_key(final_path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            local_path = Path(
+                directory,
+                f"payload.{_FORMAT_ALIASES[output_format][0]}",
+            )
+            self._serialize(frame, local_path, output_format)
+            try:
+                self._upload(local_path, temporary_path)
+                self._filesystem.mv(temporary_path, final_path)
+            finally:
+                if self._filesystem.exists(temporary_path):
+                    self._filesystem.rm(temporary_path)
+        return final_uri
+
+    def _upload(self, local_path: Path, remote_path: str) -> None:
+        parent = posixpath.dirname(remote_path)
+        if parent:
+            self._filesystem.makedirs(parent, exist_ok=True)
+        with local_path.open("rb") as source, self._filesystem.open(
+            remote_path,
+            "wb",
+        ) as destination:
+            shutil.copyfileobj(source, destination)
+
+    @staticmethod
+    def _serialize(frame: Any, path: Path, format: str) -> None:
+        LocalLandingWriter._serialize(frame, path, format)
+
+
 def write_landing(
     rows: NormalizedRows,
     *,
@@ -99,8 +196,15 @@ def write_landing(
     window: RecentTracksWindow | Sequence[int],
     destination: str | Path,
     format: str = "parquet",
-) -> Path:
-    """Write normalized rows to a local deterministic landing file."""
+) -> Path | str:
+    """Write a deterministic landing file to a local or fsspec destination."""
+    value = str(destination)
+    if urlsplit(value).scheme in FsspecLandingWriter._SUPPORTED_SCHEMES:
+        return FsspecLandingWriter(value, format=format).write(
+            username,
+            window,
+            rows,
+        )
     return LocalLandingWriter(destination, format=format).write(
         username,
         window,
@@ -223,9 +327,40 @@ def _temporary_path(final_path: Path) -> Path:
     return Path(name)
 
 
+def _temporary_key(final_path: str) -> str:
+    parent = posixpath.dirname(final_path)
+    name = posixpath.basename(final_path)
+    temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    return posixpath.join(parent, temporary_name) if parent else temporary_name
+
+
+def _landing_relative_path(
+    username: str,
+    from_timestamp: int,
+    to_timestamp: int,
+    format: str,
+) -> str:
+    extension = _FORMAT_ALIASES[format][0]
+    boundary = datetime.fromtimestamp(to_timestamp, tz=timezone.utc)
+    return (
+        f"username={username}/"
+        f"year={boundary:%Y}/"
+        f"month={boundary:%m}/"
+        f"{username}_{from_timestamp}_{to_timestamp}.{extension}"
+    )
+
+
+def _join_uri(destination: str, relative: str) -> str:
+    parsed = urlsplit(destination)
+    base_path = unquote(parsed.path).rstrip("/")
+    path = f"{base_path}/{relative}" if base_path else f"/{relative}"
+    return parsed._replace(path=path).geturl()
+
+
 LocalDestinationWriter = LocalLandingWriter
 
 __all__ = [
+    "FsspecLandingWriter",
     "LocalDestinationWriter",
     "LocalLandingWriter",
     "NORMALIZED_COLUMNS",

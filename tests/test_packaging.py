@@ -32,7 +32,7 @@ class PackagingTests(unittest.TestCase):
             "lastfm_export.cli:main",
         )
 
-    def test_project_declares_runtime_dependencies_and_cloud_extras(self) -> None:
+    def test_project_declares_base_dependencies_and_opt_in_cloud_extras(self) -> None:
         project_file = self.project_root / "pyproject.toml"
         with project_file.open("rb") as file:
             project = tomllib.load(file)
@@ -42,7 +42,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(
             metadata["optional-dependencies"],
             {
-                "aws": ["boto3", "s3fs"],
+                "aws": ["s3fs", "boto3"],
                 "azure": ["adlfs", "azure-identity"],
             },
         )
@@ -51,7 +51,7 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn("adlfs", metadata["dependencies"])
         self.assertNotIn("azure-identity", metadata["dependencies"])
 
-    def test_built_wheel_metadata_separates_runtime_dependencies_and_cloud_extras(
+    def test_built_wheel_metadata_keeps_cloud_dependencies_out_of_base_requirements(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -104,6 +104,8 @@ class PackagingTests(unittest.TestCase):
                 if ";" in requirement
             )
             self.assertEqual(unconditional, ["fsspec", "httpx", "polars"])
+            cloud_dependencies = {"s3fs", "boto3", "adlfs", "azure-identity"}
+            self.assertTrue(cloud_dependencies.isdisjoint(unconditional))
             self.assertEqual(metadata.get_all("Provides-Extra"), ["aws", "azure"])
             self.assertEqual(
                 conditional,

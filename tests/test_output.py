@@ -1,17 +1,21 @@
 import csv
+import io
 import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import polars as pl
 
 from lastfm_export import (
+    FsspecLandingWriter,
     LandingRow,
     LocalLandingWriter,
     RecentTracksWindow,
     NORMALIZED_COLUMNS,
+    write_landing,
 )
 
 
@@ -34,6 +38,40 @@ def landing_row(*, track: str = "First Track", artist: str = "The Artist") -> La
         track_title_clean=track,
         featured_artists=None,
     )
+
+
+class FilesystemDouble:
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.moves: list[tuple[str, str]] = []
+        self.opened_for_write: list[str] = []
+
+    def makedirs(self, path: str, exist_ok: bool = False) -> None:
+        del path, exist_ok
+
+    def open(self, path: str, mode: str) -> io.BytesIO:
+        if mode != "wb":
+            raise AssertionError(f"unexpected mode: {mode}")
+        self.opened_for_write.append(path)
+        stream = io.BytesIO()
+        original_close = stream.close
+
+        def close() -> None:
+            self.files[path] = stream.getvalue()
+            original_close()
+
+        stream.close = close  # type: ignore[method-assign]
+        return stream
+
+    def mv(self, source: str, destination: str) -> None:
+        self.moves.append((source, destination))
+        self.files[destination] = self.files.pop(source)
+
+    def exists(self, path: str) -> bool:
+        return path in self.files
+
+    def rm(self, path: str) -> None:
+        self.files.pop(path, None)
 
 
 class OutputTests(unittest.TestCase):
@@ -128,6 +166,84 @@ class OutputTests(unittest.TestCase):
                     self._read_tracks(expected, format_name),
                     ["retry"],
                 )
+
+    def test_fsspec_writer_routes_supported_uris_to_deterministic_keys(self) -> None:
+        window = RecentTracksWindow(1_700_000_000, 1_712_000_000)
+        relative = (
+            "username=alice/year=2024/month=04/"
+            "alice_1700000000_1712000000.jsonl"
+        )
+        destinations = (
+            "file:///landing",
+            "s3://bucket/landing",
+            "az://container/landing",
+            "abfss://container@account.dfs.core.windows.net/landing",
+        )
+
+        for destination in destinations:
+            with self.subTest(destination=destination):
+                filesystem = FilesystemDouble()
+                with patch(
+                    "fsspec.core.url_to_fs",
+                    return_value=(filesystem, "unused"),
+                ) as resolver:
+                    result = write_landing(
+                        [landing_row()],
+                        username="alice",
+                        window=window,
+                        destination=destination,
+                        format="jsonl",
+                    )
+
+                self.assertEqual(result, f"{destination}/{relative}")
+                resolver.assert_called_once_with(destination)
+                self.assertEqual(len(filesystem.moves), 1)
+                temporary_key, final_key = filesystem.moves[0]
+                self.assertEqual(
+                    Path(temporary_key).parent,
+                    Path(final_key).parent,
+                )
+                self.assertTrue(Path(temporary_key).name.startswith("."))
+                self.assertTrue(Path(temporary_key).name.endswith(".tmp"))
+                self.assertTrue(final_key.endswith(relative))
+                self.assertEqual(list(filesystem.files), [final_key])
+
+    def test_fsspec_write_finalizes_only_after_serialization_and_cleans_up(self) -> None:
+        filesystem = FilesystemDouble()
+
+        class FailingWriter(FsspecLandingWriter):
+            def _serialize(self, frame: object, path: Path, format: str) -> None:
+                del frame, path, format
+                raise RuntimeError("serialization failed")
+
+        with patch(
+            "fsspec.core.url_to_fs",
+            return_value=(filesystem, "unused"),
+        ):
+            writer = FailingWriter("s3://bucket/landing", format="jsonl")
+            with self.assertRaisesRegex(RuntimeError, "serialization failed"):
+                writer.write("alice", RecentTracksWindow(100, 200), [landing_row()])
+
+        self.assertEqual(filesystem.moves, [])
+        self.assertEqual(filesystem.files, {})
+        self.assertEqual(filesystem.opened_for_write, [])
+
+    def test_fsspec_rewriting_same_window_reuses_one_final_key(self) -> None:
+        filesystem = FilesystemDouble()
+        with patch(
+            "fsspec.core.url_to_fs",
+            return_value=(filesystem, "unused"),
+        ):
+            writer = FsspecLandingWriter("s3://bucket/landing", format="jsonl")
+            window = RecentTracksWindow(100, 200)
+            first = writer.write("alice", window, [landing_row(track="first")])
+            second = writer.write("alice", window, [landing_row(track="second")])
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(filesystem.files), 1)
+        self.assertEqual(len(filesystem.moves), 2)
+        self.assertEqual(filesystem.moves[0][1], filesystem.moves[1][1])
+        self.assertIn(b'"track":"second"', next(iter(filesystem.files.values())))
 
     @staticmethod
     def _read_tracks(path: Path, format_name: str) -> list[str]:
