@@ -33,6 +33,16 @@ _TRAILING_FEATURE = re.compile(
     r"(?P<artist>.+?)\s*$",
     re.IGNORECASE,
 )
+_TRAILING_PAREN_FEATURE = re.compile(
+    r"(?P<base>.+?)\s+\(\s*(?:feat\.|featuring|ft\.)\s+"
+    r"(?P<artist>[^()]+?)\s*\)\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_BRACKET_FEATURE = re.compile(
+    r"(?P<base>.+?)\s+\[\s*(?:feat\.|featuring|ft\.)\s+"
+    r"(?P<artist>[^\[\]]+?)\s*\]\s*$",
+    re.IGNORECASE,
+)
 _WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
@@ -112,33 +122,63 @@ def _extract_trailing_feature(
     annotation_keywords: Iterable[str] | None,
 ) -> tuple[str, str | None]:
     match = _TRAILING_FEATURE.fullmatch(track)
-    if match is None:
-        return track, None
+    if match is not None:
+        patterns = _compile_keyword_patterns(
+            DEFAULT_ANNOTATION_KEYWORDS
+            if annotation_keywords is None
+            else annotation_keywords
+        )
+        base = match.group("base").rstrip()
+        credit = match.group("artist").strip()
+        if not credit:
+            return track, None
 
-    base = match.group("base").rstrip()
-    credit = match.group("artist").strip()
-    if not credit:
-        return track, None
+        annotations = ""
+        while True:
+            candidate = _trailing_annotation(credit)
+            if candidate is None:
+                break
+            annotation_base, segment = candidate
+            if not _contains_keyword(segment, patterns):
+                break
+            annotations = credit[len(annotation_base) :] + annotations
+            credit = annotation_base.rstrip()
+
+        if not credit:
+            return track, None
+        return f"{base}{annotations}", credit
 
     patterns = _compile_keyword_patterns(
         DEFAULT_ANNOTATION_KEYWORDS
         if annotation_keywords is None
         else annotation_keywords
     )
+    core, annotations = _strip_trailing_annotations(track, patterns)
+    for pattern in (_TRAILING_PAREN_FEATURE, _TRAILING_BRACKET_FEATURE):
+        match = pattern.fullmatch(core)
+        if match is not None:
+            credit = match.group("artist").strip()
+            if credit:
+                return f"{match.group('base').rstrip()}{annotations}", credit
+
+    return track, None
+
+
+def _strip_trailing_annotations(
+    title: str,
+    patterns: tuple[re.Pattern[str], ...],
+) -> tuple[str, str]:
     annotations = ""
     while True:
-        candidate = _trailing_annotation(credit)
+        candidate = _trailing_annotation(title)
         if candidate is None:
             break
-        annotation_base, segment = candidate
+        base, segment = candidate
         if not _contains_keyword(segment, patterns):
             break
-        annotations = credit[len(annotation_base) :] + annotations
-        credit = annotation_base.rstrip()
-
-    if not credit:
-        return track, None
-    return f"{base}{annotations}", credit
+        annotations = title[len(base) :] + annotations
+        title = base.rstrip()
+    return title, annotations
 
 
 def _compile_keyword_patterns(keywords: Iterable[str]) -> tuple[re.Pattern[str], ...]:
