@@ -1,13 +1,16 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from lastfm_export.client import RecentTracksWindow
 from lastfm_export.state import CheckpointStore, Lease
 from lastfm_export.workflow import (
     FullResyncRunCoordinator,
     IncrementalRunCoordinator,
+    IncrementalRunError,
     ReconciliationWorkflow,
     calendar_year_chunks,
     select_reconciliation_workflow,
@@ -31,6 +34,58 @@ class FakeExtraction:
     ) -> list[str]:
         self.calls.append((username, window))
         return ["extracted"]
+
+
+class PagingExtraction:
+    def __init__(
+        self,
+        clock: list[float],
+        *,
+        pages: int,
+        store: CheckpointStore | None = None,
+        check_concurrency_after_page: int | None = None,
+        take_over_after_page: int | None = None,
+    ) -> None:
+        self.clock = clock
+        self.pages = pages
+        self.store = store
+        self.check_concurrency_after_page = check_concurrency_after_page
+        self.take_over_after_page = take_over_after_page
+        self.second_lease = None
+        self.calls: list[RecentTracksWindow] = []
+
+    def extract(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+        on_page: object = None,
+    ) -> list[str]:
+        self.calls.append(window)
+        for page in range(1, self.pages + 1):
+            self.clock[0] += 200
+            if (
+                self.store is not None
+                and page == self.take_over_after_page
+            ):
+                state = json.loads(self.store.state_path.read_text())
+                old_token = state["leases"][username]["token"]
+                self.assert_true(self.store.release_lease(username, old_token))
+                self.second_lease = self.store.acquire_lease(username)
+                self.assert_true(self.second_lease is not None)
+            if callable(on_page):
+                on_page()
+            if (
+                self.store is not None
+                and page == self.check_concurrency_after_page
+            ):
+                self.second_lease = self.store.acquire_lease(username)
+        return ["extracted"]
+
+    @staticmethod
+    def assert_true(value: bool) -> None:
+        if not value:
+            raise AssertionError("paging extraction assertion failed")
 
 
 class FakeLanding:
@@ -64,6 +119,40 @@ class FailingChunkLanding(FakeLanding):
 
 
 class FullResyncRunCoordinatorTests(unittest.TestCase):
+    def test_renews_lease_between_pages_and_chunks(self) -> None:
+        interval = RecentTracksWindow(
+            1_577_836_800,  # 2020-01-01T00:00:00Z
+            1_672_531_200,  # 2023-01-01T00:00:00Z
+        )
+        clock = [0.0]
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            extraction = PagingExtraction(clock, pages=3)
+            coordinator = FullResyncRunCoordinator(
+                store,
+                extraction,
+                FakeLanding(),
+                clock=lambda: interval.to_timestamp,
+            )
+
+            with patch("lastfm_export.state.time.time", side_effect=lambda: clock[0]):
+                coordinator.run(
+                    "alice",
+                    start=interval.from_timestamp,
+                    end=interval.to_timestamp,
+                )
+                self.assertEqual(
+                    store.get_committed_full_resync_chunks(
+                        "alice",
+                        interval=interval,
+                    ),
+                    calendar_year_chunks(interval),
+                )
+                self.assertIsNotNone(store.get_last_full_resync_at("alice"))
+
+            self.assertEqual(clock[0], 1800)
+
     def test_calendar_year_chunks_are_contiguous_for_extraction_and_landing(
         self,
     ) -> None:
@@ -235,6 +324,16 @@ class RecordingLease:
         self._owner.released.append(self._username)
         return self._lease.release()
 
+    def renew(self, ttl_seconds: float) -> "RecordingLease | None":
+        if not self._owner.lease_active:
+            return None
+        renewed = self._lease.renew(ttl_seconds)
+        return (
+            None
+            if renewed is None
+            else RecordingLease(renewed, self._owner, self._username)
+        )
+
 
 class RecordingCheckpointStore:
     def __init__(self, directory: Path) -> None:
@@ -297,6 +396,72 @@ class ExpiringExtraction(FakeExtraction):
 
 
 class IncrementalRunCoordinatorTests(unittest.TestCase):
+    def test_renews_lease_after_each_page_for_a_long_run(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            extraction = PagingExtraction(
+                clock,
+                pages=5,
+                store=store,
+                check_concurrency_after_page=2,
+            )
+            coordinator = IncrementalRunCoordinator(
+                store,
+                extraction,
+                FakeLanding(),
+                overlap_days=7,
+                clock=lambda: RUN_START,
+            )
+
+            with patch("lastfm_export.state.time.time", side_effect=lambda: clock[0]):
+                window = coordinator.run("alice")
+
+                self.assertIsNone(extraction.second_lease)
+                self.assertEqual(
+                    store.get_last_successful_to("alice"),
+                    window.to_timestamp,
+                )
+            self.assertEqual(clock[0], 1000)
+
+    def test_lease_takeover_between_pages_aborts_without_advancing_watermark(
+        self,
+    ) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            extraction = PagingExtraction(
+                clock,
+                pages=5,
+                store=store,
+                take_over_after_page=1,
+            )
+            coordinator = IncrementalRunCoordinator(
+                store,
+                extraction,
+                FakeLanding(),
+                overlap_days=7,
+                clock=lambda: RUN_START,
+            )
+
+            with patch("lastfm_export.state.time.time", side_effect=lambda: clock[0]):
+                with self.assertRaisesRegex(
+                    IncrementalRunError,
+                    "incremental run lease expired or was lost",
+                ):
+                    coordinator.run("alice")
+
+                self.assertIsNone(store.get_last_successful_to("alice"))
+
+    def test_unrenewed_lease_expires_after_default_ttl(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            with patch("lastfm_export.state.time.time", side_effect=lambda: clock[0]):
+                self.assertIsNotNone(store.acquire_lease("alice"))
+                clock[0] = 301
+                self.assertIsNotNone(store.acquire_lease("alice"))
+
     def test_rejects_non_finite_overlap_and_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = RecordingCheckpointStore(Path(directory))
