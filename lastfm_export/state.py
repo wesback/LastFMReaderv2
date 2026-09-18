@@ -66,15 +66,42 @@ class CheckpointStore:
                 )
             return value
 
-    def record_successful_to(self, username: str, to: int) -> None:
+    def record_successful_to(
+        self,
+        username: str,
+        to: int,
+        *,
+        lease: Lease | None = None,
+    ) -> None:
         """Persist *to* as the last successful value for *username*."""
         username = self._validate_username(username)
         if isinstance(to, bool) or not isinstance(to, int):
             raise TypeError("to must be an integer")
+        if lease is not None:
+            if not isinstance(lease, Lease):
+                raise TypeError("lease must be a Lease")
+            if lease.username != username:
+                raise ValueError("lease username does not match checkpoint user")
         with self._locked():
             state = self._read_state()
+            if lease is not None:
+                self._require_active_lease(state, username, lease=lease)
             state["checkpoints"][username] = to
             self._write_state(state)
+
+    def is_lease_active(self, lease: Lease) -> bool:
+        """Return whether *lease* still owns an unexpired user lease."""
+        if not isinstance(lease, Lease):
+            raise TypeError("lease must be a Lease")
+        with self._locked():
+            state = self._read_state()
+            current = state["leases"].get(lease.username)
+            return (
+                isinstance(current, dict)
+                and self._valid_lease_record(current)
+                and current["token"] == lease.token
+                and current["expires_at"] > time.time()
+            )
 
     def acquire_lease(
         self,
@@ -164,6 +191,23 @@ class CheckpointStore:
             current["expires_at"] = renewed.expires_at
             self._write_state(state)
             return renewed
+
+    @classmethod
+    def _require_active_lease(
+        cls,
+        state: dict[str, dict[str, object]],
+        username: str,
+        *,
+        lease: Lease,
+    ) -> None:
+        current = state["leases"].get(username)
+        if (
+            not isinstance(current, dict)
+            or not cls._valid_lease_record(current)
+            or current["token"] != lease.token
+            or current["expires_at"] <= time.time()
+        ):
+            raise StateStoreError(f"no active lease for {username!r}")
 
     # These aliases keep the state boundary convenient for workflow code while
     # retaining the explicit names used by the public contract.
