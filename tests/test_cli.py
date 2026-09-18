@@ -5,9 +5,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import httpx
+
 from lastfm_export.cli import ProgressReporter, RunRequest, main
 from lastfm_export.state import CheckpointStore
-from lastfm_export.client import RecentTracksWindow
+from lastfm_export.client import LastFMClient, RecentTracksWindow
 from lastfm_export.workflow import ReconciliationWorkflow
 
 
@@ -255,6 +257,52 @@ timezone = "UTC"
             self.assertEqual(record["retry_count"], 1)
             self.assertEqual(record["retry_causes"], ["timeout"])
             self.assertGreaterEqual(record["duration_seconds"], 0)
+
+    def test_zero_scrobbles_emit_success_summary(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "recenttracks": {
+                        "track": [],
+                        "@attr": {"totalPages": "0"},
+                    }
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--since",
+                    "1970-01-01T00:00:00Z",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: LastFMClient(
+                    "fixture-api-key",
+                    transport=httpx.MockTransport(handler),
+                ),
+                destination_writer_factory=lambda _: FixtureLanding(),
+                clock=iter_clock(100, 101, 102, 103),
+            )
+
+        record = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(record["outcome"], "success")
+        self.assertEqual(record["rows_extracted"], 0)
+        self.assertEqual(record["pages_fetched"], 1)
+        self.assertEqual(len(requests), 1)
 
     def test_failed_user_emits_redacted_summary_and_preserves_checkpoint(self) -> None:
         path = self.write_config(self.valid_config())
