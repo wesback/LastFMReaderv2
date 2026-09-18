@@ -25,6 +25,7 @@ from .retrieval import RecentTracksPaginator, Track, retrieve_scrobbles
 from .state import CheckpointStore, Lease, StateStoreError
 from .landing import LandingRow, build_landing_row, natural_key_surrogate, normalize_track
 from .output import (
+    FsspecLandingWriter,
     LocalDestinationWriter,
     LocalLandingWriter,
     NORMALIZED_COLUMNS,
@@ -45,6 +46,7 @@ __all__ = [
     "DEFAULT_ANNOTATION_KEYWORDS",
     "DEFAULT_RETRY_DELAY",
     "ExporterConfig",
+    "FsspecLandingWriter",
     "Lease",
     "LASTFM_ENDPOINT",
     "RETRYABLE_ERROR_CODES",

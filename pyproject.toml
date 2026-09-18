@@ -22,8 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 aws = [
-    "boto3",
     "s3fs",
+    "boto3",
 ]
 azure = [
     "adlfs",
