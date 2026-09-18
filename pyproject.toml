@@ -14,6 +14,21 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
+dependencies = [
+    "httpx",
+    "polars",
+    "fsspec",
+]
+
+[project.optional-dependencies]
+aws = [
+    "boto3",
+    "s3fs",
+]
+azure = [
+    "adlfs",
+    "azure-identity",
+]
 
 [project.scripts]
 lastfm-export = "lastfm_export.cli:main"

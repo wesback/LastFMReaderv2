@@ -1,8 +1,15 @@
 import io
+import os
 import pathlib
+import subprocess
+import sys
+import tempfile
 import tomllib
 import unittest
+import zipfile
 from contextlib import redirect_stdout
+from email.parser import BytesParser
+from email.policy import compat32
 from unittest.mock import patch
 
 import lastfm_export
@@ -10,8 +17,10 @@ from lastfm_export.cli import main
 
 
 class PackagingTests(unittest.TestCase):
+    project_root = pathlib.Path(__file__).parents[1]
+
     def test_project_declares_hatchling_package_and_console_script(self) -> None:
-        project_file = pathlib.Path(__file__).parents[1] / "pyproject.toml"
+        project_file = self.project_root / "pyproject.toml"
         with project_file.open("rb") as file:
             project = tomllib.load(file)
 
@@ -22,6 +31,89 @@ class PackagingTests(unittest.TestCase):
             project["project"]["scripts"]["lastfm-export"],
             "lastfm_export.cli:main",
         )
+
+    def test_project_declares_runtime_dependencies_and_cloud_extras(self) -> None:
+        project_file = self.project_root / "pyproject.toml"
+        with project_file.open("rb") as file:
+            project = tomllib.load(file)
+
+        metadata = project["project"]
+        self.assertEqual(metadata["dependencies"], ["httpx", "polars", "fsspec"])
+        self.assertEqual(
+            metadata["optional-dependencies"],
+            {
+                "aws": ["boto3", "s3fs"],
+                "azure": ["adlfs", "azure-identity"],
+            },
+        )
+        self.assertNotIn("boto3", metadata["dependencies"])
+        self.assertNotIn("s3fs", metadata["dependencies"])
+        self.assertNotIn("adlfs", metadata["dependencies"])
+        self.assertNotIn("azure-identity", metadata["dependencies"])
+
+    def test_built_wheel_metadata_separates_runtime_dependencies_and_cloud_extras(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            wheel_directory = pathlib.Path(directory)
+            environment = os.environ.copy()
+            environment["PIP_NO_INDEX"] = "1"
+            environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-index",
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "--wheel-dir",
+                    str(wheel_directory),
+                    str(self.project_root),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            wheels = list(wheel_directory.glob("*.whl"))
+            self.assertEqual(len(wheels), 1)
+            with zipfile.ZipFile(wheels[0]) as archive:
+                metadata_files = [
+                    name
+                    for name in archive.namelist()
+                    if name.endswith(".dist-info/METADATA")
+                ]
+                self.assertEqual(len(metadata_files), 1)
+                metadata = BytesParser(policy=compat32).parsebytes(
+                    archive.read(metadata_files[0])
+                )
+
+            requirements = metadata.get_all("Requires-Dist", failobj=[])
+            unconditional = sorted(
+                requirement for requirement in requirements if ";" not in requirement
+            )
+            conditional = sorted(
+                (
+                    requirement.split(";", 1)[0].strip(),
+                    requirement.split(";", 1)[1].strip().replace("'", '"'),
+                )
+                for requirement in requirements
+                if ";" in requirement
+            )
+            self.assertEqual(unconditional, ["fsspec", "httpx", "polars"])
+            self.assertEqual(metadata.get_all("Provides-Extra"), ["aws", "azure"])
+            self.assertEqual(
+                conditional,
+                [
+                    ("adlfs", 'extra == "azure"'),
+                    ("azure-identity", 'extra == "azure"'),
+                    ("boto3", 'extra == "aws"'),
+                    ("s3fs", 'extra == "aws"'),
+                ],
+            )
 
     def test_package_imports_without_configuration(self) -> None:
         self.assertEqual(lastfm_export.__version__, "0.1.0")
