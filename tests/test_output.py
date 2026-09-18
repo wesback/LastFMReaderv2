@@ -17,6 +17,7 @@ from lastfm_export import (
     NORMALIZED_COLUMNS,
     write_landing,
 )
+from lastfm_export.output import _polars_frame
 
 
 def landing_row(*, track: str = "First Track", artist: str = "The Artist") -> LandingRow:
@@ -33,7 +34,7 @@ def landing_row(*, track: str = "First Track", artist: str = "The Artist") -> La
         album_mbid=None,
         scrobbled_at_uts=timestamp,
         scrobbled_at_utc=moment,
-        scrobbled_at_local=moment,
+        scrobbled_at_local=moment.replace(tzinfo=None),
         url="https://last.fm/track",
         track_title_clean=track,
         featured_artists=None,
@@ -75,6 +76,22 @@ class FilesystemDouble:
 
 
 class OutputTests(unittest.TestCase):
+    def test_polars_frame_accepts_featured_artist_after_schema_inference_sample(
+        self,
+    ) -> None:
+        records = [landing_row(track=f"Track {index}").as_dict() for index in range(150)]
+        records.append(
+            landing_row(track="Featuring Track").as_dict()
+            | {"featured_artists": ["Edwin Hawkins Singers"]}
+        )
+
+        frame = _polars_frame(records)
+
+        self.assertEqual(
+            frame.get_column("featured_artists").to_list()[-1],
+            ["Edwin Hawkins Singers"],
+        )
+
     def test_writes_each_format_to_utc_to_partition_with_normalized_rows(self) -> None:
         window = RecentTracksWindow(1_700_000_000, 1_712_000_000)
         expected_relative = Path(

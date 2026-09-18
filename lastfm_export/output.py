@@ -88,7 +88,11 @@ class LocalLandingWriter:
         if format == "jsonl":
             frame.write_ndjson(path)
         elif format == "csv":
-            frame.write_csv(path)
+            import polars as pl
+
+            frame.with_columns(
+                pl.col("featured_artists").cast(pl.String)
+            ).write_csv(path)
         elif format == "parquet":
             frame.write_parquet(path)
         else:
@@ -295,26 +299,23 @@ def _record_as_dict(record: NormalizedRecord) -> dict[str, Any]:
 def _polars_frame(records: list[dict[str, Any]]) -> Any:
     import polars as pl
 
-    if records:
-        return pl.DataFrame(records)
-    return pl.DataFrame(
-        schema={
-            "event_id": pl.String,
-            "username": pl.String,
-            "artist": pl.String,
-            "artist_mbid": pl.String,
-            "track": pl.String,
-            "track_mbid": pl.String,
-            "album": pl.String,
-            "album_mbid": pl.String,
-            "scrobbled_at_uts": pl.Int64,
-            "scrobbled_at_utc": pl.Datetime(time_unit="us", time_zone="UTC"),
-            "scrobbled_at_local": pl.Datetime(time_unit="us"),
-            "url": pl.String,
-            "track_title_clean": pl.String,
-            "featured_artists": pl.List(pl.String),
-        }
-    )
+    schema = {
+        "event_id": pl.String,
+        "username": pl.String,
+        "artist": pl.String,
+        "artist_mbid": pl.String,
+        "track": pl.String,
+        "track_mbid": pl.String,
+        "album": pl.String,
+        "album_mbid": pl.String,
+        "scrobbled_at_uts": pl.Int64,
+        "scrobbled_at_utc": pl.Datetime(time_unit="us", time_zone="UTC"),
+        "scrobbled_at_local": pl.Datetime(time_unit="us"),
+        "url": pl.String,
+        "track_title_clean": pl.String,
+        "featured_artists": pl.List(pl.String),
+    }
+    return pl.DataFrame(records, schema=schema)
 
 
 def _temporary_path(final_path: Path) -> Path:
