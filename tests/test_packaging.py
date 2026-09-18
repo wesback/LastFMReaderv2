@@ -1,6 +1,7 @@
 import io
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -129,3 +130,24 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("usage:", output.getvalue())
         self.assertIn("lastfm-export", output.getvalue())
+
+    def test_dockerfile_uses_non_root_runtime_entry_point(self) -> None:
+        dockerfile = (self.project_root / "Dockerfile").read_text()
+
+        self.assertRegex(
+            dockerfile,
+            r"(?m)^FROM\s+python:3\.12-slim\s*$",
+        )
+        self.assertIn("pip install --no-cache-dir .", dockerfile)
+        user_match = re.search(r"(?m)^USER\s+([^\s]+)\s*$", dockerfile)
+        self.assertIsNotNone(user_match)
+        user = user_match.group(1)
+        self.assertNotEqual(user, "root")
+        self.assertRegex(
+            dockerfile,
+            rf"(?ms)^RUN\b.*?\buseradd\b.*?\b{re.escape(user)}\b",
+        )
+        self.assertRegex(
+            dockerfile,
+            r'(?m)^ENTRYPOINT\s+\["lastfm-export"\]\s*$',
+        )
