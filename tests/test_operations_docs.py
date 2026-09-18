@@ -13,9 +13,11 @@ class OperationsDocumentationTests(unittest.TestCase):
     ) -> None:
         guide = self.read_doc("installation.md")
 
-        self.assertIn("python -m pip install lastfm-export", guide)
-        self.assertIn("python -m pip install 'lastfm-export[aws]'", guide)
-        self.assertIn("python -m pip install 'lastfm-export[azure]'", guide)
+        self.assertIn("Clone or check out the repository", guide)
+        self.assertIn("python3 -m pip install -e .", guide)
+        self.assertIn("python3 -m pip install -e '.[aws]'", guide)
+        self.assertIn("python3 -m pip install -e '.[azure]'", guide)
+        self.assertNotIn("pip install lastfm-export", guide)
         self.assertIn("environment variable", guide)
         self.assertIn("native credential chains", guide)
         self.assertIn("rather than committed configuration", guide)
