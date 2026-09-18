@@ -167,8 +167,37 @@ class LastFMClient:
                     self._minimum_delay_after(request_started_at),
                 )
                 continue
+            except httpx.TransportError:
+                if attempt == self._max_retries:
+                    raise
+                self._retry_count += 1
+                self._retry_causes.append("transport")
+                retry_delay = self._retry_delay_for(attempt)
+                retry_delay = max(
+                    retry_delay,
+                    self._minimum_delay_after(request_started_at),
+                )
+                continue
 
-            payload = self._decode_payload(response)
+            try:
+                payload = self._decode_payload(response)
+            except httpx.HTTPStatusError:
+                if (
+                    response.status_code not in {500, 502, 503, 504}
+                    or attempt == self._max_retries
+                ):
+                    raise
+                self._retry_count += 1
+                self._retry_causes.append(
+                    f"http_status:{response.status_code}"
+                )
+                retry_delay = self._retry_delay_for(attempt, response=response)
+                retry_delay = max(
+                    retry_delay,
+                    self._minimum_delay_after(request_started_at),
+                )
+                continue
+
             error = _api_error(payload, response)
             if error is None:
                 response.raise_for_status()
