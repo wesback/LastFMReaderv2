@@ -1,6 +1,6 @@
 import unittest
 
-from lastfm_export import clean_title
+from lastfm_export import clean_title, enrich_title
 
 
 class TitleCleaningTests(unittest.TestCase):
@@ -55,3 +55,33 @@ class TitleCleaningTests(unittest.TestCase):
         for title in titles:
             with self.subTest(title=title):
                 self.assertEqual(clean_title(title), title)
+
+
+class TitleEnrichmentTests(unittest.TestCase):
+    def test_extracts_trailing_featuring_credits_before_annotations(self) -> None:
+        result = enrich_title("Song feat. Guest Artist (Live)")
+
+        self.assertEqual(result.track_title_clean, "Song")
+        self.assertEqual(result.featured_artists, ["Guest Artist"])
+
+    def test_extracts_credit_before_parenthesized_and_dash_annotations(self) -> None:
+        result = enrich_title("Song feat. Guest Artist (Live) - Radio Edit")
+
+        self.assertEqual(result.track_title_clean, "Song")
+        self.assertEqual(result.featured_artists, ["Guest Artist"])
+
+    def test_recognizes_supported_trailing_credit_markers(self) -> None:
+        for marker in ("feat.", "featuring", "ft."):
+            with self.subTest(marker=marker):
+                result = enrich_title(f"Song {marker} Guest Artist")
+                self.assertEqual(result.featured_artists, ["Guest Artist"])
+                self.assertEqual(result.track_title_clean, "Song")
+
+    def test_returns_null_credit_and_preserves_source_track_without_credit(self) -> None:
+        track = "SONG (LIVE)"
+
+        result = enrich_title(track)
+
+        self.assertIsNone(result.featured_artists)
+        self.assertEqual(result.track, track)
+        self.assertEqual(result.track_title_clean, "Song")

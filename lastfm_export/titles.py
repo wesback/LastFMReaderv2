@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 DEFAULT_ANNOTATION_KEYWORDS: tuple[str, ...] = (
     "remaster",
@@ -27,7 +28,21 @@ _TRAILING_PARENTHESES = re.compile(r"(?P<base>.*?)(?P<segment>\([^()]*\)|\[[^\[\
 _TRAILING_DASH = re.compile(
     r"(?P<base>.+?)\s*[-\u2013\u2014]\s*(?P<segment>[^-\u2013\u2014]+)\s*$"
 )
+_TRAILING_FEATURE = re.compile(
+    r"(?P<base>.+?)\s+(?:feat\.|featuring|ft\.)\s+"
+    r"(?P<artist>.+?)\s*$",
+    re.IGNORECASE,
+)
 _WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+@dataclass(frozen=True)
+class TitleEnrichment:
+    """Raw and derived title fields for one Last.fm track."""
+
+    track: str
+    track_title_clean: str
+    featured_artists: list[str] | None
 
 
 def clean_title(
@@ -62,6 +77,68 @@ def clean_title(
         title = base.rstrip()
 
     return _correct_degenerate_case(title)
+
+
+def enrich_title(
+    track: str,
+    annotation_keywords: Iterable[str] | None = None,
+) -> TitleEnrichment:
+    """Extract a trailing featuring credit before deriving the clean title.
+
+    The source track is retained verbatim.  A credit is represented as one
+    artist entry because this stage recognizes the credit marker, rather than
+    attempting general artist-name parsing.
+    """
+    if not isinstance(track, str):
+        raise TypeError("track must be a string")
+
+    keywords = (
+        None
+        if annotation_keywords is None
+        else tuple(annotation_keywords)
+    )
+    title, featured_artist = _extract_trailing_feature(track, keywords)
+    return TitleEnrichment(
+        track=track,
+        track_title_clean=clean_title(title, keywords),
+        featured_artists=(
+            [featured_artist] if featured_artist is not None else None
+        ),
+    )
+
+
+def _extract_trailing_feature(
+    track: str,
+    annotation_keywords: Iterable[str] | None,
+) -> tuple[str, str | None]:
+    match = _TRAILING_FEATURE.fullmatch(track)
+    if match is None:
+        return track, None
+
+    base = match.group("base").rstrip()
+    credit = match.group("artist").strip()
+    if not credit:
+        return track, None
+
+    patterns = _compile_keyword_patterns(
+        DEFAULT_ANNOTATION_KEYWORDS
+        if annotation_keywords is None
+        else annotation_keywords
+    )
+    annotations = ""
+    while True:
+        candidate = _trailing_annotation(credit)
+        if candidate is None:
+            break
+        annotation_base, segment = candidate
+        if not _contains_keyword(segment, patterns):
+            break
+        annotations = credit[len(annotation_base) :] + annotations
+        credit = annotation_base.rstrip()
+
+    if not credit:
+        return track, None
+    return f"{base}{annotations}", credit
 
 
 def _compile_keyword_patterns(keywords: Iterable[str]) -> tuple[re.Pattern[str], ...]:
