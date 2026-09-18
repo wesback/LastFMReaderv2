@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from lastfm_export.cli import ProgressReporter, RunRequest, main
+from lastfm_export.state import CheckpointStore
+from lastfm_export.client import RecentTracksWindow
 from lastfm_export.workflow import ReconciliationWorkflow
 
 
@@ -221,6 +223,233 @@ timezone = "UTC"
         self.assertIsNone(records[1]["last_successful_to"])
         self.assertIsNone(records[1]["staleness_seconds"])
         self.assertEqual(records[1]["status"], "uninitialized")
+
+    def test_run_emits_one_populated_terminal_summary_per_user(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            extraction = FixtureExtraction()
+            landing = FixtureLanding()
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: extraction,
+                destination_writer_factory=lambda _: landing,
+                clock=iter_clock(100, 101, 102, 103, 104, 105, 106),
+            )
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(result, 0)
+        self.assertEqual([record["username"] for record in records], ["alice", "bob"])
+        for record in records:
+            self.assertEqual(record["outcome"], "success")
+            self.assertEqual(record["rows_extracted"], 2)
+            self.assertEqual(record["rows_skipped_now_playing"], 1)
+            self.assertEqual(record["pages_fetched"], 3)
+            self.assertEqual(record["retry_count"], 1)
+            self.assertEqual(record["retry_causes"], ["timeout"])
+            self.assertGreaterEqual(record["duration_seconds"], 0)
+
+    def test_failed_user_emits_redacted_summary_and_preserves_checkpoint(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        secret = "fixture-secret-value"
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            store.record_successful_to("alice", 50)
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": secret},
+                output=output,
+                transport_factory=lambda _: FailingExtraction(secret),
+                destination_writer_factory=lambda _: FixtureLanding(),
+                clock=iter_clock(100, 101, 102, 103),
+            )
+
+            self.assertEqual(store.get_last_successful_to("alice"), 50)
+
+        self.assertNotEqual(result, 0)
+        record = json.loads(output.getvalue())
+        self.assertEqual(record["username"], "alice")
+        self.assertEqual(record["outcome"], "failed")
+        self.assertNotIn(secret, output.getvalue())
+        self.assertEqual(record["error"]["type"], "RuntimeError")
+
+    def test_full_resync_dispatches_and_accumulates_window_metrics(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--full-resync",
+                    "--since",
+                    "2019-01-01T00:00:00Z",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: FixtureExtraction(),
+                destination_writer_factory=lambda _: FixtureLanding(),
+                clock=iter_clock(
+                    1_609_459_200,
+                    1_609_459_200,
+                    1_609_459_201,
+                    1_609_459_202,
+                    1_609_459_200,
+                    1_609_459_201,
+                    1_609_459_202,
+                ),
+            )
+
+            store = CheckpointStore(directory)
+            self.assertIsNotNone(store.get_last_full_resync_at("alice"))
+            self.assertIsNotNone(store.get_last_full_resync_at("bob"))
+            self.assertIsNone(store.get_last_successful_to("alice"))
+            self.assertIsNone(store.get_last_successful_to("bob"))
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(result, 0)
+        for record in records:
+            self.assertEqual(record["outcome"], "success")
+            self.assertEqual(record["rows_extracted"], 4)
+            self.assertEqual(record["rows_skipped_now_playing"], 2)
+            self.assertEqual(record["pages_fetched"], 6)
+            self.assertEqual(record["retry_count"], 2)
+            self.assertEqual(record["retry_causes"], ["timeout", "timeout"])
+
+    def test_failed_retrieval_summary_keeps_observed_metrics(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: PartialMetricsClient(),
+                destination_writer_factory=lambda _: FixtureLanding(),
+                clock=iter_clock(100, 101, 102, 103),
+            )
+
+        record = json.loads(output.getvalue())
+        self.assertNotEqual(result, 0)
+        self.assertEqual(record["outcome"], "failed")
+        self.assertEqual(record["rows_extracted"], 0)
+        self.assertEqual(record["rows_skipped_now_playing"], 2)
+        self.assertEqual(record["pages_fetched"], 3)
+        self.assertEqual(record["retry_count"], 2)
+        self.assertEqual(record["retry_causes"], ["timeout", "timeout"])
+
+    def test_default_transport_is_closed_after_setup_failure(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        client = Mock()
+
+        with patch("lastfm_export.cli.LastFMClient", return_value=client):
+            result = main(
+                ["--config", str(path)],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                destination_writer_factory=Mock(
+                    side_effect=RuntimeError("destination fixture failed")
+                ),
+            )
+
+        self.assertNotEqual(result, 0)
+        client.close.assert_called_once_with()
+
+
+def iter_clock(*values: float):
+    iterator = iter(values)
+    return lambda: next(iterator)
+
+
+class FixtureExtraction:
+    pages_fetched = 3
+    rows_skipped_now_playing = 1
+    retry_count = 1
+    retry_causes = ("timeout",)
+
+    def extract(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[str]:
+        return [f"{username}-one", f"{username}-two"]
+
+
+class FailingExtraction(FixtureExtraction):
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    def extract(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[str]:
+        raise RuntimeError(f"landing fixture failed: {self.secret}")
+
+
+class PartialMetricsClient:
+    pages_fetched = 3
+    rows_skipped_now_playing = 2
+    retry_count = 2
+    retry_causes = ("timeout", "timeout")
+    last_retrieval_stats = None
+
+    def reset_metrics(self) -> None:
+        return None
+
+    def get_scrobbles(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[object]:
+        self.last_retrieval_stats = type(
+            "RetrievalStatsFixture",
+            (),
+            {
+                "pages_fetched": self.pages_fetched,
+                "rows_skipped_now_playing": self.rows_skipped_now_playing,
+            },
+        )()
+        raise RuntimeError("retrieval fixture failed")
+
+
+class FixtureLanding:
+    def land(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+        records: list[str],
+    ) -> None:
+        return None
 
 
 class FakeCheckpointStore:

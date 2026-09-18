@@ -4,17 +4,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol, TextIO
 
+from .client import LastFMClient, RecentTracksWindow
 from .config import ConfigurationError, ExporterConfig, load_config
+from .landing import normalize_track
+from .logging import (
+    RunSummary,
+    exception_log_record,
+    serialize_run_summary,
+)
+from .output import write_landing
 from .progress import ProgressReporter
 from .state import CheckpointStore, StateStoreError
-from .workflow import ReconciliationWorkflow
+from .titles import enrich_title
+from .workflow import (
+    CheckpointPort,
+    FullResyncRunCoordinator,
+    IncrementalRunCoordinator,
+    LandingWriterPort,
+    ReconciliationWorkflow,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +43,9 @@ class RunRequest:
     dry_run: bool
     full_resync: bool
     config_path: Path
+    state_dir: Path | None = None
+    api_key: str | None = field(default=None, repr=False)
+    secrets: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def users(self) -> tuple[str, ...]:
@@ -105,6 +124,7 @@ def build_run_request(
     config: ExporterConfig,
     *,
     config_path: str | Path,
+    environ: Mapping[str, str] | None = None,
 ) -> RunRequest:
     """Build the integration-facing request from parsed CLI options."""
     option_user = arguments.selected_user
@@ -124,6 +144,17 @@ def build_run_request(
         if selected_user is not None
         else tuple(user.username for user in config.users)
     )
+    environment = os.environ if environ is None else environ
+    api_key = environment.get(config.api_key_env)
+    configured_secrets = tuple(
+        value
+        for value in (
+            api_key,
+            config.destination,
+            *(user.destination for user in config.users),
+        )
+        if value
+    )
     return RunRequest(
         config=config,
         selected_users=selected_users,
@@ -131,6 +162,13 @@ def build_run_request(
         dry_run=arguments.dry_run,
         full_resync=arguments.full_resync,
         config_path=Path(config_path),
+        state_dir=(
+            Path(arguments.state_dir)
+            if getattr(arguments, "state_dir", None)
+            else None
+        ),
+        api_key=api_key,
+        secrets=configured_secrets,
     )
 
 
@@ -154,7 +192,248 @@ def parse_run_request(
         arguments,
         config,
         config_path=arguments.config,
+        environ=environ,
     )
+
+
+class _ConfiguredExtraction:
+    """Adapt the configured Last.fm client to normalized landing rows."""
+
+    def __init__(self, client: LastFMClient, request: RunRequest) -> None:
+        self.client = client
+        self.request = request
+        self.pages_fetched = 0
+        self.rows_skipped_now_playing = 0
+        self.rows_extracted = 0
+        self.retry_count = 0
+        self.retry_causes: tuple[str, ...] = ()
+
+    def extract(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[object]:
+        self.client.reset_metrics()
+        self.pages_fetched = 0
+        self.rows_skipped_now_playing = 0
+        self.retry_count = 0
+        self.retry_causes = ()
+        self.rows_extracted = 0
+        try:
+            tracks = self.client.get_scrobbles(username, window=window)
+            self.rows_extracted = len(tracks)
+            user = self.request.config.user(username)
+            rows = []
+            for track in tracks:
+                source_title = track.get("name", track.get("track"))
+                if not isinstance(source_title, str):
+                    raise ValueError("extracted track is missing name")
+                rows.append(
+                    normalize_track(
+                        track,
+                        username,
+                        user.timezone,
+                        enrich_title(source_title),
+                    )
+                )
+            return rows
+        finally:
+            retrieval_stats = self.client.last_retrieval_stats
+            self.pages_fetched = getattr(retrieval_stats, "pages_fetched", 0)
+            self.rows_skipped_now_playing = getattr(
+                retrieval_stats,
+                "rows_skipped_now_playing",
+                0,
+            )
+            self.retry_count = self.client.retry_count
+            self.retry_causes = self.client.retry_causes
+
+
+class _ConfiguredLanding:
+    """Adapt the configured destination to the landing workflow boundary."""
+
+    def __init__(self, request: RunRequest) -> None:
+        self.request = request
+
+    def land(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+        records: object,
+    ) -> object:
+        user = self.request.config.user(username)
+        return write_landing(
+            records,
+            username=username,
+            window=window,
+            destination=user.destination,
+            format=self.request.config.format,
+        )
+
+
+def _factory_for_user(value: object, username: str) -> object:
+    if isinstance(value, Mapping) and username in value:
+        return value[username]
+    return value
+
+
+def _extraction_port(
+    value: object,
+    *,
+    request: RunRequest,
+) -> object:
+    if isinstance(value, LastFMClient):
+        return _ConfiguredExtraction(value, request)
+    if callable(getattr(value, "extract", None)):
+        return value
+    if callable(getattr(value, "get_scrobbles", None)):
+        return _ConfiguredExtraction(value, request)  # type: ignore[arg-type]
+    if callable(value):
+        class CallableExtraction:
+            def extract(
+                self,
+                username: str,
+                *,
+                window: RecentTracksWindow,
+            ) -> object:
+                return value(username, window=window)
+
+        return CallableExtraction()
+    raise TypeError("transport factory must return an extraction port")
+
+
+def _landing_port(value: object) -> object:
+    if callable(getattr(value, "land", None)):
+        return value
+    if callable(getattr(value, "write", None)):
+        return LandingWriterPort(value.write)
+    if callable(value):
+        class CallableLanding:
+            def land(
+                self,
+                username: str,
+                *,
+                window: RecentTracksWindow,
+                records: object,
+            ) -> object:
+                return value(username, window, records)
+
+        return CallableLanding()
+    raise TypeError("destination writer factory must return a landing port")
+
+
+class _MeasuredExtraction:
+    """Capture returned records while preserving extraction metrics."""
+
+    def __init__(self, delegate: object) -> None:
+        self.delegate = delegate
+        self.last_records: object = ()
+        self.rows_extracted = 0
+        self.rows_skipped_now_playing = 0
+        self.pages_fetched = 0
+        self.retry_count = 0
+        self.retry_causes: list[str] = []
+
+    def extract(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> object:
+        records: object = ()
+        try:
+            records = self.delegate.extract(username, window=window)
+            self.last_records = records
+            return records
+        finally:
+            self.rows_extracted += _records_count(
+                records,
+                default=int(_metric(self.delegate, "rows_extracted", 0)),
+            )
+            self.rows_skipped_now_playing += int(
+                _metric(self.delegate, "rows_skipped_now_playing", 0)
+            )
+            self.pages_fetched += int(_metric(self.delegate, "pages_fetched", 0))
+            self.retry_count += int(_metric(self.delegate, "retry_count", 0))
+            retry_causes = _metric(self.delegate, "retry_causes", ())
+            if isinstance(retry_causes, str):
+                self.retry_causes.append(retry_causes)
+            else:
+                self.retry_causes.extend(str(cause) for cause in retry_causes)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.delegate, name)
+
+
+def _records_count(records: object, *, default: int) -> int:
+    try:
+        return max(len(records), default)  # type: ignore[arg-type]
+    except TypeError:
+        return default
+
+
+def _metric(source: object, name: str, default: object) -> object:
+    if isinstance(source, Mapping):
+        value = source.get(name)
+        return default if value is None else value
+    value = getattr(source, name, None)
+    if value is not None:
+        return value
+    stats = getattr(source, "stats", None)
+    value = getattr(stats, name, None)
+    return default if value is None else value
+
+
+def _summary(
+    username: str,
+    *,
+    outcome: str,
+    started_at: float,
+    ended_at: float,
+    extraction: object | None,
+    records: object = (),
+    error: BaseException | None = None,
+    secrets: tuple[str, ...] = (),
+) -> str:
+    try:
+        rows_extracted = len(records)  # type: ignore[arg-type]
+    except TypeError:
+        rows_extracted = int(
+            _metric(extraction, "rows_extracted", 0) if extraction else 0
+        )
+    if extraction is not None:
+        rows_extracted = max(
+            rows_extracted,
+            int(_metric(extraction, "rows_extracted", 0)),
+        )
+    retry_causes_value = _metric(extraction, "retry_causes", ()) if extraction else ()
+    if isinstance(retry_causes_value, str):
+        retry_causes = (retry_causes_value,)
+    else:
+        retry_causes = tuple(str(cause) for cause in retry_causes_value)
+    summary = RunSummary(
+        username=username,
+        outcome=outcome,
+        rows_extracted=rows_extracted,
+        rows_skipped_now_playing=int(
+            _metric(extraction, "rows_skipped_now_playing", 0)
+            if extraction
+            else 0
+        ),
+        pages_fetched=int(_metric(extraction, "pages_fetched", 0) if extraction else 0),
+        retry_count=int(_metric(extraction, "retry_count", 0) if extraction else 0),
+        retry_causes=retry_causes,
+        duration_seconds=max(0.0, ended_at - started_at),
+    )
+    fields = summary.as_dict()
+    if error is not None:
+        fields["error"] = exception_log_record(
+            error,
+            secrets=secrets,
+        )["exception"]
+    return serialize_run_summary(fields, secrets=secrets)
 
 
 def execute_run(
@@ -163,25 +442,122 @@ def execute_run(
     output: TextIO | None = None,
     transport_factory: TransportFactory | None = None,
     destination_writer_factory: DestinationWriterFactory | None = None,
+    checkpoint_store: CheckpointPort | None = None,
+    clock: Clock = time.time,
 ) -> int:
-    """Dispatch a validated request while preserving integration seams.
-
-    Dry-run intentionally returns before either integration factory is called.
-    The factories are optional until extraction and landing implementations are
-    added by later stories.
-    """
+    """Execute every selected user and emit one terminal summary per user."""
     if request.dry_run:
         return 0
 
     reporter = ProgressReporter(output)
-    reporter.report(
-        f"Exporting {', '.join(request.selected_users)}"
-    )
-    if transport_factory is not None:
-        transport_factory(request)
-    if destination_writer_factory is not None:
-        destination_writer_factory(request)
-    return 0
+    reporter.report(f"Exporting {', '.join(request.selected_users)}")
+    output_stream = output if output is not None else sys.stdout
+    started_setup = clock()
+    owned_transport = False
+    transport: object | None = None
+    try:
+        if transport_factory is not None:
+            transport = transport_factory(request)
+        else:
+            transport = LastFMClient(request.api_key or "")
+            owned_transport = True
+        destination = (
+            destination_writer_factory(request)
+            if destination_writer_factory is not None
+            else None
+        )
+        store = checkpoint_store
+        if store is None or not callable(getattr(store, "acquire_lease", None)):
+            directory = request.state_dir or request.config_path.parent / ".lastfm-export"
+            store = CheckpointStore(directory)
+    except Exception as error:
+        for username in request.selected_users:
+            now = clock()
+            print(
+                _summary(
+                    username,
+                    outcome="failed",
+                    started_at=started_setup,
+                    ended_at=now,
+                    extraction=None,
+                    error=error,
+                    secrets=request.secrets,
+                ),
+                file=output_stream,
+            )
+        if owned_transport and transport is not None:
+            close = getattr(transport, "close", None)
+            if callable(close):
+                close()
+        return 1
+
+    failures = 0
+    try:
+        for username in request.selected_users:
+            started_at = clock()
+            extraction: object | None = None
+            records: object = ()
+            try:
+                user_transport = _factory_for_user(transport, username)
+                user_destination = (
+                    _factory_for_user(destination, username)
+                    if destination is not None
+                    else _ConfiguredLanding(request)
+                )
+                extraction = _MeasuredExtraction(
+                    _extraction_port(user_transport, request=request)
+                )
+                landing = _landing_port(user_destination)
+                if request.full_resync:
+                    coordinator = FullResyncRunCoordinator(
+                        store,  # type: ignore[arg-type]
+                        extraction,  # type: ignore[arg-type]
+                        landing,  # type: ignore[arg-type]
+                        clock=clock,
+                    )
+                    coordinator.run(
+                        username,
+                        start=request.since or 0,
+                        end=int(started_at),
+                    )
+                else:
+                    coordinator = IncrementalRunCoordinator(
+                        store,
+                        extraction,  # type: ignore[arg-type]
+                        landing,  # type: ignore[arg-type]
+                        overlap_days=request.config.overlap,
+                        clock=clock,
+                    )
+                    coordinator.run(username, since=request.since)
+                records = extraction.last_records
+                outcome = "success"
+                error = None
+            except Exception as caught:
+                failures += 1
+                outcome = "failed"
+                error = caught
+                if extraction is not None:
+                    records = getattr(extraction, "last_records", records)
+            ended_at = clock()
+            print(
+                _summary(
+                    username,
+                    outcome=outcome,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    extraction=extraction,
+                    records=records,
+                    error=error,
+                    secrets=request.secrets,
+                ),
+                file=output_stream,
+            )
+        return 1 if failures else 0
+    finally:
+        if owned_transport and transport is not None:
+            close = getattr(transport, "close", None)
+            if callable(close):
+                close()
 
 
 def run(
@@ -190,6 +566,8 @@ def run(
     output: TextIO | None = None,
     transport_factory: TransportFactory | None = None,
     destination_writer_factory: DestinationWriterFactory | None = None,
+    checkpoint_store: CheckpointPort | None = None,
+    clock: Clock = time.time,
 ) -> int:
     """Execute a run request through the current integration seam."""
     return execute_run(
@@ -197,6 +575,8 @@ def run(
         output=output,
         transport_factory=transport_factory,
         destination_writer_factory=destination_writer_factory,
+        checkpoint_store=checkpoint_store,
+        clock=clock,
     )
 
 
@@ -273,6 +653,7 @@ def main(
                 arguments.since,
                 arguments.dry_run,
                 arguments.full_resync,
+                arguments.state_dir,
             )
         )
         if has_run_options:
@@ -311,6 +692,7 @@ def main(
             arguments,
             config,
             config_path=arguments.config,
+            environ=environ,
         )
     except ConfigurationError as error:
         print(f"configuration error: {error}", file=error_stream)
@@ -324,6 +706,12 @@ def main(
         output=output_stream,
         transport_factory=transport_factory,
         destination_writer_factory=destination_writer_factory,
+        checkpoint_store=(
+            checkpoint_store
+            if callable(getattr(checkpoint_store, "acquire_lease", None))
+            else None
+        ),
+        clock=clock,
     )
 
 

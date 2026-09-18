@@ -81,6 +81,9 @@ class LastFMClient:
         self._retry_delay = retry_delay
         self._sleeper = sleeper
         self._clock = clock
+        self._retry_count = 0
+        self._retry_causes: list[str] = []
+        self.last_retrieval_stats = None
         self._client = httpx.Client(
             timeout=httpx.Timeout(
                 connect=connect_timeout,
@@ -145,6 +148,8 @@ class LastFMClient:
             except httpx.TimeoutException:
                 if attempt == self._max_retries:
                     raise
+                self._retry_count += 1
+                self._retry_causes.append("timeout")
                 self._sleeper(self._retry_delay_for(attempt))
                 continue
 
@@ -157,6 +162,8 @@ class LastFMClient:
                 raise error
             if attempt == self._max_retries:
                 raise error
+            self._retry_count += 1
+            self._retry_causes.append(f"api_error:{error.code}")
             self._sleeper(self._retry_delay_for(attempt, response=response))
 
         raise AssertionError("retry loop exhausted without returning or raising")
@@ -170,7 +177,28 @@ class LastFMClient:
         """Retrieve dated scrobbles for a fixed, bounded run window."""
         from .retrieval import RecentTracksPaginator
 
-        return RecentTracksPaginator(self).fetch(username, window=window)
+        paginator = RecentTracksPaginator(self)
+        try:
+            result = paginator.fetch(username, window=window)
+        finally:
+            self.last_retrieval_stats = paginator.stats
+        return result
+
+    @property
+    def retry_count(self) -> int:
+        """Return retries performed since the last metrics reset."""
+        return self._retry_count
+
+    @property
+    def retry_causes(self) -> tuple[str, ...]:
+        """Return stable causes for retries performed since the last reset."""
+        return tuple(self._retry_causes)
+
+    def reset_metrics(self) -> None:
+        """Reset per-run retry and retrieval counters."""
+        self._retry_count = 0
+        self._retry_causes.clear()
+        self.last_retrieval_stats = None
 
     def close(self) -> None:
         """Close the underlying HTTP client."""

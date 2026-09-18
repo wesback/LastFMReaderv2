@@ -21,7 +21,12 @@ from .logging import (
     serialize_run_summary,
 )
 from .progress import ProgressReporter
-from .retrieval import RecentTracksPaginator, Track, retrieve_scrobbles
+from .retrieval import (
+    RecentTracksPaginator,
+    RetrievalStats,
+    Track,
+    retrieve_scrobbles,
+)
 from .state import CheckpointStore, Lease, StateStoreError
 from .workflow import (
     CheckpointPort,
@@ -89,6 +94,7 @@ __all__ = [
     "ProgressReporter",
     "ReconciliationWorkflow",
     "RecentTracksPaginator",
+    "RetrievalStats",
     "RecentTracksExtraction",
     "RecentTracksWindow",
     "SecretRedactor",
