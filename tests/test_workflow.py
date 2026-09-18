@@ -1,10 +1,17 @@
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from lastfm_export.client import RecentTracksWindow
 from lastfm_export.state import CheckpointStore, Lease
-from lastfm_export.workflow import IncrementalRunCoordinator
+from lastfm_export.workflow import (
+    FullResyncRunCoordinator,
+    IncrementalRunCoordinator,
+    ReconciliationWorkflow,
+    calendar_year_chunks,
+    select_reconciliation_workflow,
+)
 
 
 RUN_START = 1_768_867_200  # 2026-01-20T00:00:00Z
@@ -41,6 +48,176 @@ class FakeLanding:
         self.calls.append((username, window, records))
         if self.fail:
             raise RuntimeError("landing failed")
+
+
+class FailingChunkLanding(FakeLanding):
+    def land(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+        records: list[str],
+    ) -> None:
+        super().land(username, window=window, records=records)
+        if len(self.calls) == 2:
+            raise RuntimeError("landing failed")
+
+
+class FullResyncRunCoordinatorTests(unittest.TestCase):
+    def test_calendar_year_chunks_are_contiguous_for_extraction_and_landing(
+        self,
+    ) -> None:
+        interval = RecentTracksWindow(
+            1_577_836_800,  # 2020-01-01T00:00:00Z
+            1_672_531_200,  # 2023-01-01T00:00:00Z
+        )
+        chunks = calendar_year_chunks(interval)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            extraction = FakeExtraction()
+            landing = FakeLanding()
+            coordinator = FullResyncRunCoordinator(
+                store,
+                extraction,
+                landing,
+                clock=lambda: 1_672_531_200,
+            )
+
+            self.assertEqual(
+                coordinator.run(
+                    "alice",
+                    start=interval.from_timestamp,
+                    end=interval.to_timestamp,
+                ),
+                chunks,
+            )
+            self.assertEqual(
+                [call[1] for call in extraction.calls],
+                list(chunks),
+            )
+            self.assertEqual(
+                [call[1] for call in landing.calls],
+                list(chunks),
+            )
+            self.assertEqual(chunks[0].from_timestamp, interval.from_timestamp)
+            self.assertEqual(chunks[-1].to_timestamp, interval.to_timestamp)
+            for previous, current in zip(chunks, chunks[1:]):
+                self.assertEqual(previous.to_timestamp, current.from_timestamp)
+            self.assertIsNotNone(store.acquire_lease("alice", ttl_seconds=1))
+
+    def test_failed_chunk_is_resumable_without_repeating_committed_chunk(
+        self,
+    ) -> None:
+        interval = RecentTracksWindow(
+            int(datetime(2020, 7, 1, tzinfo=timezone.utc).timestamp()),
+            int(datetime(2022, 7, 1, tzinfo=timezone.utc).timestamp()),
+        )
+        chunks = calendar_year_chunks(interval)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            extraction = FakeExtraction()
+            landing = FailingChunkLanding()
+            coordinator = FullResyncRunCoordinator(
+                store,
+                extraction,
+                landing,
+                clock=lambda: interval.to_timestamp,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "landing failed"):
+                coordinator.run(
+                    "alice",
+                    start=interval.from_timestamp,
+                    end=interval.to_timestamp,
+                )
+
+            self.assertEqual(
+                store.get_committed_full_resync_chunks(
+                    "alice",
+                    interval=interval,
+                ),
+                (chunks[0],),
+            )
+
+            coordinator.run(
+                "alice",
+                start=interval.from_timestamp,
+                end=interval.to_timestamp,
+            )
+
+            self.assertEqual(
+                [call[1] for call in extraction.calls],
+                [chunks[0], chunks[1], chunks[1], chunks[2]],
+            )
+            self.assertEqual(
+                store.get_committed_full_resync_chunks(
+                    "alice",
+                    interval=interval,
+                ),
+                chunks,
+            )
+            self.assertEqual(
+                store.get_last_full_resync_at("alice"),
+                interval.to_timestamp,
+            )
+
+    def test_full_resync_releases_lease_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            landing = FakeLanding(fail=True)
+            coordinator = FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                landing,
+                clock=lambda: 1_700_000_000,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "landing failed"):
+                coordinator.run(
+                    "alice",
+                    start=1_577_836_800,
+                    end=1_609_459_200,
+                )
+
+            self.assertIsNotNone(store.acquire_lease("alice", ttl_seconds=1))
+
+
+class ReconciliationSelectionTests(unittest.TestCase):
+    def test_cadence_due_interval_selects_full_resync_workflow(self) -> None:
+        self.assertEqual(
+            select_reconciliation_workflow(
+                explicit_full_resync=False,
+                last_full_resync_at=1_700_000_000,
+                now=1_700_000_000 + 30 * 24 * 60 * 60,
+                cadence_days=30,
+            ),
+            ReconciliationWorkflow.FULL_RESYNC,
+        )
+
+    def test_explicit_full_resync_selects_full_resync_workflow(self) -> None:
+        self.assertEqual(
+            select_reconciliation_workflow(
+                explicit_full_resync=True,
+                last_full_resync_at=1_700_000_000,
+                now=1_700_000_001,
+                cadence_days=30,
+            ),
+            ReconciliationWorkflow.FULL_RESYNC,
+        )
+
+    def test_interval_not_cadence_due_selects_no_reconciliation_workflow(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            select_reconciliation_workflow(
+                explicit_full_resync=False,
+                last_full_resync_at=1_700_000_000,
+                now=1_700_000_001,
+                cadence_days=30,
+            )
+        )
 
 
 class RecordingLease:

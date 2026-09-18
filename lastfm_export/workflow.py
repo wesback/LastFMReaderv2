@@ -1,10 +1,11 @@
-"""Overlap-safe incremental export coordination."""
+"""Overlap-safe incremental and resumable full-resync coordination."""
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
+from enum import Enum
 from math import ceil, isfinite
 from typing import Generic, Protocol, TypeVar
 
@@ -67,8 +68,52 @@ class CheckpointPort(Protocol):
         """Acquire the exclusive lease for a username."""
 
 
+class FullResyncCheckpointPort(CheckpointPort, Protocol):
+    """Checkpoint boundary required by resumable full resynchronization."""
+
+    def get_committed_full_resync_chunks(
+        self,
+        username: str,
+        *,
+        interval: RecentTracksWindow,
+    ) -> tuple[RecentTracksWindow, ...]:
+        """Return already committed chunks for this exact interval."""
+
+    def record_committed_full_resync_chunk(
+        self,
+        username: str,
+        *,
+        interval: RecentTracksWindow,
+        chunk: RecentTracksWindow,
+        lease: Lease,
+    ) -> None:
+        """Record one successfully landed chunk while holding *lease*."""
+
+    def get_last_full_resync_at(self, username: str) -> int | None:
+        """Return when the latest full resync completed."""
+
+    def record_full_resync_completed(
+        self,
+        username: str,
+        completed_at: int,
+        *,
+        lease: Lease,
+    ) -> None:
+        """Record full-run completion while holding *lease*."""
+
+
 class IncrementalRunError(RuntimeError):
     """Raised when an incremental run cannot acquire its user lease."""
+
+
+class FullResyncRunError(RuntimeError):
+    """Raised when a full resync cannot acquire or retain its user lease."""
+
+
+class ReconciliationWorkflow(str, Enum):
+    """The reconciliation workflow selected for a run."""
+
+    FULL_RESYNC = "full-resync"
 
 
 class RecentTracksExtraction(Generic[Extracted]):
@@ -230,6 +275,174 @@ def run_incremental(
     ).run(username, since=since)
 
 
+class FullResyncRunCoordinator(Generic[Extracted]):
+    """Coordinate a resumable, calendar-year-chunked full resync.
+
+    A chunk is considered committed only after extraction and landing both
+    succeed and the durable state records that chunk.  A failed chunk is
+    therefore retried on the next invocation, while earlier chunks are
+    skipped.
+    """
+
+    def __init__(
+        self,
+        checkpoint_store: FullResyncCheckpointPort,
+        extraction: ExtractionPort[Extracted],
+        landing: LandingPort[Extracted],
+        *,
+        clock: RunClock = time.time,
+        lease_ttl_seconds: float = 300,
+    ) -> None:
+        if isinstance(lease_ttl_seconds, bool) or not isinstance(
+            lease_ttl_seconds,
+            (int, float),
+        ):
+            raise TypeError("lease_ttl_seconds must be a number")
+        if not isfinite(float(lease_ttl_seconds)) or lease_ttl_seconds <= 0:
+            raise ValueError("lease_ttl_seconds must be finite and positive")
+        self._checkpoint_store = checkpoint_store
+        self._extraction = extraction
+        self._landing = landing
+        self._clock = clock
+        self._lease_ttl_seconds = lease_ttl_seconds
+
+    def run(
+        self,
+        username: str,
+        *,
+        start: Timestamp = 0,
+        end: Timestamp | None = None,
+    ) -> tuple[RecentTracksWindow, ...]:
+        """Run or resume a full resync over the requested half-open interval."""
+        if end is None:
+            raise ValueError("full resync end is required")
+        interval = _window(
+            start=_timestamp(start, name="full-resync start"),
+            end=_timestamp(end, name="full-resync end"),
+        )
+        lease = self._checkpoint_store.acquire_lease(
+            username,
+            ttl_seconds=self._lease_ttl_seconds,
+        )
+        if lease is None:
+            raise FullResyncRunError(
+                f"an export run is already active for {username!r}"
+            )
+
+        try:
+            self._require_active_lease(lease)
+            committed = set(
+                self._checkpoint_store.get_committed_full_resync_chunks(
+                    username,
+                    interval=interval,
+                )
+            )
+            chunks = calendar_year_chunks(interval)
+            for chunk in chunks:
+                self._require_active_lease(lease)
+                if chunk in committed:
+                    continue
+                records = self._extraction.extract(username, window=chunk)
+                self._require_active_lease(lease)
+                self._landing.land(
+                    username,
+                    window=chunk,
+                    records=records,
+                )
+                self._require_active_lease(lease)
+                self._checkpoint_store.record_committed_full_resync_chunk(
+                    username,
+                    interval=interval,
+                    chunk=chunk,
+                    lease=lease,
+                )
+                committed.add(chunk)
+            self._require_active_lease(lease)
+            self._checkpoint_store.record_full_resync_completed(
+                username,
+                _timestamp(self._clock(), name="full-resync completion"),
+                lease=lease,
+            )
+            return chunks
+        finally:
+            lease.release()
+
+    def _require_active_lease(self, lease: Lease) -> None:
+        if not self._checkpoint_store.is_lease_active(lease):
+            raise FullResyncRunError("full resync lease expired or was lost")
+
+
+# Keep the shorter name available for callers that treat reconciliation as a
+# workflow rather than a run type.
+FullResyncCoordinator = FullResyncRunCoordinator
+
+
+def run_full_resync(
+    username: str,
+    *,
+    checkpoint_store: FullResyncCheckpointPort,
+    extraction: ExtractionPort[Extracted],
+    landing: LandingPort[Extracted],
+    start: Timestamp = 0,
+    end: Timestamp,
+    clock: RunClock = time.time,
+    lease_ttl_seconds: float = 300,
+) -> tuple[RecentTracksWindow, ...]:
+    """Convenience function for coordinating one full resync."""
+    return FullResyncRunCoordinator(
+        checkpoint_store,
+        extraction,
+        landing,
+        clock=clock,
+        lease_ttl_seconds=lease_ttl_seconds,
+    ).run(username, start=start, end=end)
+
+
+def calendar_year_chunks(
+    interval: RecentTracksWindow,
+) -> tuple[RecentTracksWindow, ...]:
+    """Split an integer UTC interval at calendar-year boundaries."""
+    start, end = _bounded_window(interval, name="calendar-year interval")
+    if start == end:
+        return ()
+    chunks: list[RecentTracksWindow] = []
+    current = start
+    while current < end:
+        current_date = datetime.fromtimestamp(current, tz=timezone.utc)
+        next_year = datetime(
+            current_date.year + 1,
+            1,
+            1,
+            tzinfo=timezone.utc,
+        )
+        boundary = min(end, int(next_year.timestamp()))
+        chunks.append(RecentTracksWindow(current, boundary))
+        current = boundary
+    return tuple(chunks)
+
+
+def select_reconciliation_workflow(
+    *,
+    explicit_full_resync: bool,
+    last_full_resync_at: Timestamp | None,
+    now: Timestamp,
+    cadence_days: int | float | str,
+) -> ReconciliationWorkflow | None:
+    """Select full reconciliation only when explicitly requested or due."""
+    if explicit_full_resync:
+        return ReconciliationWorkflow.FULL_RESYNC
+    if last_full_resync_at is None:
+        return ReconciliationWorkflow.FULL_RESYNC
+    cadence_seconds = _cadence_seconds(cadence_days)
+    elapsed = _timestamp(now, name="now") - _timestamp(
+        last_full_resync_at,
+        name="last-full-resync",
+    )
+    if elapsed >= cadence_seconds:
+        return ReconciliationWorkflow.FULL_RESYNC
+    return None
+
+
 def _incremental_start(
     checkpoint: int | None,
     *,
@@ -244,6 +457,39 @@ def _window(*, start: int, end: int) -> RecentTracksWindow:
     if start > end:
         raise ValueError("incremental window start must not be later than run-start")
     return RecentTracksWindow(start, end)
+
+
+def _bounded_window(
+    window: RecentTracksWindow,
+    *,
+    name: str,
+) -> tuple[int, int]:
+    if not isinstance(window, RecentTracksWindow):
+        raise TypeError(f"{name} must be a RecentTracksWindow")
+    if window.from_timestamp is None or window.to_timestamp is None:
+        raise ValueError(f"{name} must have both bounds")
+    if (
+        isinstance(window.from_timestamp, bool)
+        or isinstance(window.to_timestamp, bool)
+        or not isinstance(window.from_timestamp, int)
+        or not isinstance(window.to_timestamp, int)
+    ):
+        raise TypeError(f"{name} bounds must be integers")
+    if window.from_timestamp < 0 or window.from_timestamp > window.to_timestamp:
+        raise ValueError(f"{name} bounds are invalid")
+    return window.from_timestamp, window.to_timestamp
+
+
+def _cadence_seconds(cadence_days: int | float | str) -> float:
+    if isinstance(cadence_days, bool):
+        raise TypeError("cadence_days must be a number")
+    try:
+        cadence = float(cadence_days)
+    except (TypeError, ValueError):
+        raise ValueError("cadence_days must be a number") from None
+    if not isfinite(cadence) or cadence < 0:
+        raise ValueError("cadence_days must be finite and non-negative")
+    return cadence * 24 * 60 * 60
 
 
 def _timestamp(value: Timestamp, *, name: str) -> int:
@@ -274,10 +520,18 @@ def _timestamp(value: Timestamp, *, name: str) -> int:
 __all__ = [
     "CheckpointPort",
     "ExtractionPort",
+    "FullResyncCheckpointPort",
+    "FullResyncCoordinator",
+    "FullResyncRunCoordinator",
+    "FullResyncRunError",
     "IncrementalRunCoordinator",
     "IncrementalRunError",
     "LandingPort",
     "LandingWriterPort",
+    "ReconciliationWorkflow",
     "RecentTracksExtraction",
+    "calendar_year_chunks",
+    "run_full_resync",
     "run_incremental",
+    "select_reconciliation_workflow",
 ]

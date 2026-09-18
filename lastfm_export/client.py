@@ -37,7 +37,7 @@ class LastFMAPIError(LastFMError):
 
 @dataclass(frozen=True)
 class RecentTracksWindow:
-    """Optional inclusive Last.fm Unix timestamp bounds for a request."""
+    """Unix timestamp bounds for a half-open ``[from, to)`` request window."""
 
     from_timestamp: int | None = None
     to_timestamp: int | None = None

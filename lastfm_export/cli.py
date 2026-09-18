@@ -14,6 +14,7 @@ from typing import Callable, Protocol, TextIO
 from .config import ConfigurationError, ExporterConfig, load_config
 from .progress import ProgressReporter
 from .state import CheckpointStore, StateStoreError
+from .workflow import ReconciliationWorkflow
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,15 @@ class RunRequest:
     def users(self) -> tuple[str, ...]:
         """Return the configured usernames targeted by this run."""
         return self.selected_users
+
+    @property
+    def reconciliation_workflow(self) -> ReconciliationWorkflow | None:
+        """Return the explicitly requested reconciliation workflow, if any."""
+        return (
+            ReconciliationWorkflow.FULL_RESYNC
+            if self.full_resync
+            else None
+        )
 
 
 TransportFactory = Callable[[RunRequest], object]

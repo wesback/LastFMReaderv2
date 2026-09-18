@@ -14,6 +14,8 @@ from typing import Iterator
 
 import fcntl
 
+from .client import RecentTracksWindow
+
 
 class StateStoreError(RuntimeError):
     """Raised when the durable state cannot be read or written."""
@@ -87,6 +89,105 @@ class CheckpointStore:
             if lease is not None:
                 self._require_active_lease(state, username, lease=lease)
             state["checkpoints"][username] = to
+            self._write_state(state)
+
+    def get_committed_full_resync_chunks(
+        self,
+        username: str,
+        *,
+        interval: RecentTracksWindow,
+    ) -> tuple[RecentTracksWindow, ...]:
+        """Return committed chunks for one exact full-resync interval."""
+        username = self._validate_username(username)
+        interval_key = _interval_key(interval)
+        with self._locked():
+            state = self._read_state()
+            user_runs = state["full_resync"].get(username, {})
+            if not isinstance(user_runs, dict):
+                raise StateStoreError(
+                    f"invalid full resync state for {username!r}"
+                )
+            records = user_runs.get(interval_key, [])
+            if not isinstance(records, list):
+                raise StateStoreError(
+                    f"invalid full resync chunks for {username!r}"
+                )
+            return tuple(_window_from_record(record) for record in records)
+
+    def record_committed_full_resync_chunk(
+        self,
+        username: str,
+        *,
+        interval: RecentTracksWindow,
+        chunk: RecentTracksWindow,
+        lease: Lease,
+    ) -> None:
+        """Record one landed full-resync chunk while holding *lease*."""
+        username = self._validate_username(username)
+        interval_key = _interval_key(interval)
+        interval_from, interval_to = _window_bounds(interval)
+        from_timestamp, to_timestamp = _window_bounds(chunk)
+        if (
+            from_timestamp < interval_from
+            or to_timestamp > interval_to
+        ):
+            raise ValueError("full resync chunk must be within its interval")
+        if not isinstance(lease, Lease):
+            raise TypeError("lease must be a Lease")
+        if lease.username != username:
+            raise ValueError("lease username does not match full resync user")
+        with self._locked():
+            state = self._read_state()
+            self._require_active_lease(state, username, lease=lease)
+            user_runs = state["full_resync"].setdefault(username, {})
+            if not isinstance(user_runs, dict):
+                raise StateStoreError(
+                    f"invalid full resync state for {username!r}"
+                )
+            records = user_runs.setdefault(interval_key, [])
+            if not isinstance(records, list):
+                raise StateStoreError(
+                    f"invalid full resync chunks for {username!r}"
+                )
+            record = {"from": from_timestamp, "to": to_timestamp}
+            if record not in records:
+                records.append(record)
+                records.sort(key=lambda item: (item["from"], item["to"]))
+            self._write_state(state)
+
+    def get_last_full_resync_at(self, username: str) -> int | None:
+        """Return the completion timestamp of the latest full resync."""
+        username = self._validate_username(username)
+        with self._locked():
+            state = self._read_state()
+            value = state["full_resync_completed_at"].get(username)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int)
+            ):
+                raise StateStoreError(
+                    f"full resync completion for {username!r} is not an integer"
+                )
+            return value
+
+    def record_full_resync_completed(
+        self,
+        username: str,
+        completed_at: int,
+        *,
+        lease: Lease,
+    ) -> None:
+        """Record a completed full resync while holding *lease*."""
+        username = self._validate_username(username)
+        if isinstance(completed_at, bool) or not isinstance(completed_at, int):
+            raise TypeError("completed_at must be an integer")
+        if not isinstance(lease, Lease):
+            raise TypeError("lease must be a Lease")
+        if lease.username != username:
+            raise ValueError("lease username does not match full resync user")
+        with self._locked():
+            state = self._read_state()
+            self._require_active_lease(state, username, lease=lease)
+            state["full_resync_completed_at"][username] = completed_at
             self._write_state(state)
 
     def is_lease_active(self, lease: Lease) -> bool:
@@ -246,7 +347,12 @@ class CheckpointStore:
 
     def _read_state(self) -> dict[str, dict[str, object]]:
         if not self.state_path.exists():
-            return {"checkpoints": {}, "leases": {}}
+            return {
+                "checkpoints": {},
+                "leases": {},
+                "full_resync": {},
+                "full_resync_completed_at": {},
+            }
         try:
             with self.state_path.open(encoding="utf-8") as state_file:
                 state = json.load(state_file)
@@ -256,6 +362,17 @@ class CheckpointStore:
             not isinstance(state, dict)
             or not isinstance(state.get("checkpoints"), dict)
             or not isinstance(state.get("leases"), dict)
+        ):
+            raise StateStoreError(f"invalid state format in {self.state_path}")
+        # State files written before resumable full resync support are migrated
+        # in memory and receive the new keys on the next state write.
+        if "full_resync" not in state:
+            state["full_resync"] = {}
+        if "full_resync_completed_at" not in state:
+            state["full_resync_completed_at"] = {}
+        if not isinstance(state["full_resync"], dict) or not isinstance(
+            state["full_resync_completed_at"],
+            dict,
         ):
             raise StateStoreError(f"invalid state format in {self.state_path}")
         return state
@@ -280,3 +397,42 @@ class CheckpointStore:
             if "temporary_path" in locals():
                 temporary_path.unlink(missing_ok=True)
             raise StateStoreError(f"unable to write {self.state_path}") from error
+
+
+def _window_bounds(window: RecentTracksWindow) -> tuple[int, int]:
+    if not isinstance(window, RecentTracksWindow):
+        raise TypeError("window must be a RecentTracksWindow")
+    if (
+        window.from_timestamp is None
+        or window.to_timestamp is None
+        or isinstance(window.from_timestamp, bool)
+        or isinstance(window.to_timestamp, bool)
+        or not isinstance(window.from_timestamp, int)
+        or not isinstance(window.to_timestamp, int)
+    ):
+        raise ValueError("full resync windows must have integer bounds")
+    if window.from_timestamp < 0 or window.from_timestamp > window.to_timestamp:
+        raise ValueError("full resync window bounds are invalid")
+    return window.from_timestamp, window.to_timestamp
+
+
+def _interval_key(interval: RecentTracksWindow) -> str:
+    from_timestamp, to_timestamp = _window_bounds(interval)
+    return f"{from_timestamp}:{to_timestamp}"
+
+
+def _window_from_record(record: object) -> RecentTracksWindow:
+    if not isinstance(record, dict):
+        raise StateStoreError("invalid full resync chunk record")
+    from_timestamp = record.get("from")
+    to_timestamp = record.get("to")
+    if (
+        isinstance(from_timestamp, bool)
+        or isinstance(to_timestamp, bool)
+        or not isinstance(from_timestamp, int)
+        or not isinstance(to_timestamp, int)
+        or from_timestamp < 0
+        or from_timestamp > to_timestamp
+    ):
+        raise StateStoreError("invalid full resync chunk bounds")
+    return RecentTracksWindow(from_timestamp, to_timestamp)
