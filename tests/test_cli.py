@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 
-from lastfm_export.cli import ProgressReporter, RunRequest, main
+from lastfm_export.cli import ProgressReporter, RunRequest, build_parser, main
 from lastfm_export.state import CheckpointStore
 from lastfm_export.client import LastFMClient, RecentTracksWindow
 from lastfm_export.workflow import ReconciliationWorkflow
@@ -181,6 +181,31 @@ timezone = "UTC"
                 self.assertEqual(result, 2)
                 self.assertIn("--since", error.getvalue())
                 extraction.extract.assert_not_called()
+
+    def test_invalid_since_values_are_usage_errors(self) -> None:
+        path = self.write_config(self.valid_config())
+        for value in ("-5", "2024-13-01"):
+            with self.subTest(value=value):
+                error = io.StringIO()
+                result = main(
+                    [
+                        "--config",
+                        str(path),
+                        "--since",
+                        value,
+                    ],
+                    environ={"LASTFM_TEST_API_KEY": "test-key"},
+                    error_output=error,
+                )
+
+                self.assertEqual(result, 2)
+                self.assertIn("--since", error.getvalue())
+
+    def test_since_help_describes_unix_and_iso8601_formats(self) -> None:
+        help_text = build_parser().format_help()
+
+        self.assertIn("Unix timestamp", help_text)
+        self.assertIn("ISO-8601", help_text)
 
     def test_since_is_normalized_before_coordinator_parsing(self) -> None:
         path = self.write_config(self.valid_config())
