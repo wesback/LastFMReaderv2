@@ -600,10 +600,12 @@ def _timestamp(value: Timestamp, *, name: str) -> int:
         raise TypeError(f"{name} must be a timestamp")
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            raise ValueError(f"{name} must include a timezone")
+            value = value.replace(tzinfo=timezone.utc)
         return int(value.astimezone(timezone.utc).timestamp())
     if isinstance(value, str):
         normalized = value.strip()
+        if normalized.isdigit():
+            return _timestamp(int(normalized), name=name)
         if normalized.endswith("Z"):
             normalized = f"{normalized[:-1]}+00:00"
         try:

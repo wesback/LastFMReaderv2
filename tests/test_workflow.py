@@ -768,6 +768,57 @@ class IncrementalRunCoordinatorTests(unittest.TestCase):
             self.assertEqual(extraction.calls, [("alice", expected)])
             self.assertEqual(landing.calls[0][1], expected)
 
+    def test_since_accepts_unix_date_naive_and_zoned_values(self) -> None:
+        values = (
+            ("1700000000", 1_700_000_000),
+            ("2024-01-01", 1_704_067_200),
+            ("2024-01-01T00:00:00", 1_704_067_200),
+            ("2024-01-01T00:00:00Z", 1_704_067_200),
+            ("2024-01-01T01:00:00+01:00", 1_704_067_200),
+        )
+
+        for since, expected_from in values:
+            with self.subTest(since=since), tempfile.TemporaryDirectory() as directory:
+                store = RecordingCheckpointStore(Path(directory))
+                extraction = FakeExtraction()
+                landing = FakeLanding()
+                coordinator = IncrementalRunCoordinator(
+                    store,
+                    extraction,
+                    landing,
+                    overlap_days=7,
+                    clock=lambda: RUN_START,
+                )
+
+                window = coordinator.run("alice", since=since)
+
+                self.assertEqual(window.from_timestamp, expected_from)
+                self.assertEqual(
+                    extraction.calls,
+                    [("alice", RecentTracksWindow(expected_from, RUN_START))],
+                )
+
+    def test_full_resync_accepts_date_only_since(self) -> None:
+        end = 1_704_153_600  # 2024-01-02T00:00:00Z
+        extraction = FakeExtraction()
+
+        with tempfile.TemporaryDirectory() as directory:
+            FullResyncRunCoordinator(
+                CheckpointStore(Path(directory)),
+                extraction,
+                FakeLanding(),
+                clock=lambda: end,
+            ).run(
+                "alice",
+                start="2024-01-01",
+                end=end,
+            )
+
+        self.assertEqual(
+            extraction.calls[0],
+            ("alice", RecentTracksWindow(1_704_067_200, end)),
+        )
+
     def test_fractional_overlap_rounds_up_to_preserve_configured_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = RecordingCheckpointStore(Path(directory))

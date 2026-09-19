@@ -10,7 +10,6 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol, TextIO
 
@@ -32,6 +31,7 @@ from .workflow import (
     IncrementalRunCoordinator,
     LandingWriterPort,
     ReconciliationWorkflow,
+    _timestamp,
     _call_extraction,
 )
 
@@ -102,7 +102,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--since",
         type=str,
-        help="override the configured watermark",
+        help=(
+            "Unix timestamp or ISO-8601 date/time; override the configured "
+            "watermark"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -136,10 +139,10 @@ def build_run_request(
         if since.endswith("Z"):
             since = f"{since[:-1]}+00:00"
         try:
-            datetime.fromisoformat(since)
-        except ValueError as error:
+            _timestamp(since, name="since")
+        except (TypeError, ValueError) as error:
             raise ConfigurationError(
-                "--since must be an ISO-8601 timestamp"
+                f"--since is invalid: {error}"
             ) from error
 
     option_user = arguments.selected_user
