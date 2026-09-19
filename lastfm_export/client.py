@@ -222,9 +222,14 @@ class LastFMClient:
         *,
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
+        on_tracks: PageTracksCallback | None = None,
     ) -> list[Mapping[str, Any]]:
-        """Retrieve dated scrobbles for a fixed, bounded run window."""
-        from .retrieval import RecentTracksPaginator
+        """Retrieve dated scrobbles for a fixed, bounded run window.
+
+        Supplying ``on_tracks`` delivers each page without retaining all raw
+        tracks in the returned list.
+        """
+        from .retrieval import PageTracksCallback, RecentTracksPaginator
 
         paginator = RecentTracksPaginator(self)
         try:
@@ -232,6 +237,7 @@ class LastFMClient:
                 username,
                 window=window,
                 on_page=on_page,
+                on_tracks=on_tracks,
             )
         finally:
             self.last_retrieval_stats = paginator.stats

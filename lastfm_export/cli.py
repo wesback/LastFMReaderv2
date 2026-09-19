@@ -239,29 +239,11 @@ class _ConfiguredExtraction:
         self.retry_count = 0
         self.retry_causes = ()
         self.rows_extracted = 0
-        try:
-            try:
-                parameters = inspect.signature(
-                    self.client.get_scrobbles
-                ).parameters.values()
-            except (TypeError, ValueError):
-                parameters = ()
-            if any(
-                parameter.name == "on_page"
-                or parameter.kind is parameter.VAR_KEYWORD
-                for parameter in parameters
-            ):
-                tracks = self.client.get_scrobbles(
-                    username,
-                    window=window,
-                    on_page=on_page,
-                )
-            else:
-                tracks = self.client.get_scrobbles(username, window=window)
-            self.rows_extracted = len(tracks)
-            user = self.request.config.user(username)
-            rows = []
-            for track in tracks:
+        user = self.request.config.user(username)
+        rows: list[object] = []
+
+        def normalize_page(tracks: object) -> None:
+            for track in tracks:  # type: ignore[union-attr]
                 source_title = track.get("name", track.get("track"))
                 if not isinstance(source_title, str):
                     raise ValueError("extracted track is missing name")
@@ -273,6 +255,36 @@ class _ConfiguredExtraction:
                         enrich_title(source_title),
                     )
                 )
+
+        try:
+            try:
+                parameters = inspect.signature(
+                    self.client.get_scrobbles
+                ).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            accepts_on_page = any(
+                parameter.name == "on_page"
+                or parameter.kind is parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            accepts_on_tracks = any(
+                parameter.name == "on_tracks"
+                or parameter.kind is parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            arguments: dict[str, object] = {"window": window}
+            if accepts_on_page:
+                arguments["on_page"] = on_page
+            if accepts_on_tracks:
+                arguments["on_tracks"] = normalize_page
+            tracks = self.client.get_scrobbles(
+                username,
+                **arguments,  # type: ignore[arg-type]
+            )
+            if not accepts_on_tracks:
+                normalize_page(tracks)
+            self.rows_extracted = len(rows)
             return rows
         finally:
             retrieval_stats = self.client.last_retrieval_stats
