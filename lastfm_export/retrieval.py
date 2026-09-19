@@ -8,6 +8,7 @@ from typing import Any
 from .client import LastFMClient, LastFMError, RecentTracksWindow
 
 Track = Mapping[str, Any]
+PageTracksCallback = Callable[[list[Track]], None]
 
 
 class RetrievalStats:
@@ -35,12 +36,16 @@ class RecentTracksPaginator:
         *,
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
+        on_tracks: PageTracksCallback | None = None,
     ) -> list[Track]:
         """Fetch pages through page one’s reported ``totalPages``.
 
         The page count is deliberately read only from the first response.
         Last.fm result counts can change while later pages are being read, but
         a fixed first-page boundary keeps a run bounded and repeatable.
+
+        When ``on_tracks`` is provided, each page's dated tracks is delivered
+        to that callback and is not retained in the returned list.
         """
         _validate_bounded_window(window)
         pages_fetched = 0
@@ -57,6 +62,9 @@ class RecentTracksPaginator:
             total_pages = _total_pages(first_page)
             tracks, skipped = _dated_tracks(first_page, window)
             rows_skipped_now_playing += skipped
+            if on_tracks is not None:
+                on_tracks(tracks)
+                tracks = []
 
             for page in range(2, total_pages + 1):
                 response = self._client.get_recent_tracks(
@@ -68,7 +76,10 @@ class RecentTracksPaginator:
                 if on_page is not None:
                     on_page()
                 page_tracks, skipped = _dated_tracks(response, window)
-                tracks.extend(page_tracks)
+                if on_tracks is not None:
+                    on_tracks(page_tracks)
+                else:
+                    tracks.extend(page_tracks)
                 rows_skipped_now_playing += skipped
             return tracks
         finally:
@@ -81,12 +92,14 @@ def retrieve_scrobbles(
     *,
     window: RecentTracksWindow,
     on_page: Callable[[], None] | None = None,
+    on_tracks: PageTracksCallback | None = None,
 ) -> list[Track]:
     """Retrieve dated scrobbles through the bounded request client."""
     return RecentTracksPaginator(client).fetch(
         username,
         window=window,
         on_page=on_page,
+        on_tracks=on_tracks,
     )
 
 
@@ -162,4 +175,10 @@ def _dated_tracks(
     return dated, skipped_now_playing
 
 
-__all__ = ["RecentTracksPaginator", "RetrievalStats", "Track", "retrieve_scrobbles"]
+__all__ = [
+    "PageTracksCallback",
+    "RecentTracksPaginator",
+    "RetrievalStats",
+    "Track",
+    "retrieve_scrobbles",
+]

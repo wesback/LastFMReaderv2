@@ -1,13 +1,23 @@
 import io
 import json
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
+import polars as pl
 
-from lastfm_export.cli import ProgressReporter, RunRequest, build_parser, main
+from lastfm_export.cli import (
+    ProgressReporter,
+    RunRequest,
+    _ConfiguredExtraction,
+    _ConfiguredLanding,
+    build_parser,
+    main,
+    parse_run_request,
+)
 from lastfm_export.state import CheckpointStore
 from lastfm_export.client import LastFMClient, RecentTracksWindow
 from lastfm_export.workflow import ReconciliationWorkflow
@@ -592,6 +602,136 @@ timezone = "UTC"
 
         self.assertNotEqual(result, 0)
         client.close.assert_called_once_with()
+
+    def test_configured_extraction_lands_20000_rows_without_raw_payload_retention(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as destination:
+            request = self.configured_request(destination)
+
+            def handler(http_request: httpx.Request) -> httpx.Response:
+                page = int(http_request.url.params["page"])
+                tracks = []
+                for index in range(200):
+                    number = (page - 1) * 200 + index
+                    tracks.append(
+                        {
+                            "artist": {
+                                "mbid": f"artist-{number}",
+                                "#text": "Artist",
+                            },
+                            "album": {
+                                "mbid": f"album-{number}",
+                                "#text": "Album",
+                            },
+                            "name": f"Track {number}",
+                            "mbid": f"track-{number}",
+                            "url": f"https://last.fm/track/{number}",
+                            "streamable": "0",
+                            "image": [{"#text": f"image-{i}"} for i in range(4)],
+                            "date": {
+                                "uts": str(number + 1),
+                                "#text": "date",
+                            },
+                        }
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "recenttracks": {
+                            "track": tracks,
+                            "@attr": {"totalPages": "100"},
+                        }
+                    },
+                )
+
+            client = LastFMClient(
+                "fixture-api-key",
+                transport=httpx.MockTransport(handler),
+                sleeper=lambda _: None,
+                clock=lambda: 0,
+            )
+            self.addCleanup(client.close)
+            extraction = _ConfiguredExtraction(client, request)
+            landing = _ConfiguredLanding(request)
+            window = RecentTracksWindow(0, 20_001)
+
+            tracemalloc.start()
+            try:
+                rows = extraction.extract("alice", window=window)
+                path = landing.land("alice", window=window, records=rows)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+            frame = pl.read_parquet(path)
+            self.assertLessEqual(peak, 40 * 1024 * 1024)
+            self.assertEqual(frame.height, 20_000)
+            self.assertEqual(frame.get_column("event_id").n_unique(), 20_000)
+            self.assertEqual(extraction.pages_fetched, 100)
+            self.assertEqual(extraction.rows_extracted, 20_000)
+            self.assertEqual(extraction.rows_skipped_now_playing, 0)
+
+    def test_configured_extraction_skips_now_playing_track(self) -> None:
+        with tempfile.TemporaryDirectory() as destination:
+            request = self.configured_request(destination)
+
+            def handler(_: httpx.Request) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={
+                        "recenttracks": {
+                            "track": [
+                                {
+                                    "artist": {"#text": "Artist", "mbid": "artist"},
+                                    "name": "Now Playing",
+                                    "mbid": "now-playing",
+                                    "url": "https://last.fm/now-playing",
+                                    "@attr": {"nowplaying": "1"},
+                                },
+                                {
+                                    "artist": {"#text": "Artist", "mbid": "artist"},
+                                    "album": {"#text": "Album", "mbid": "album"},
+                                    "name": "Scrobbled",
+                                    "mbid": "scrobbled",
+                                    "url": "https://last.fm/scrobbled",
+                                    "date": {"uts": "100", "#text": "date"},
+                                },
+                            ],
+                            "@attr": {"totalPages": "1"},
+                        }
+                    },
+                )
+
+            client = LastFMClient(
+                "fixture-api-key",
+                transport=httpx.MockTransport(handler),
+                sleeper=lambda _: None,
+                clock=lambda: 0,
+            )
+            self.addCleanup(client.close)
+            extraction = _ConfiguredExtraction(client, request)
+            landing = _ConfiguredLanding(request)
+            window = RecentTracksWindow(0, 200)
+            rows = extraction.extract("alice", window=window)
+            path = landing.land("alice", window=window, records=rows)
+
+            frame = pl.read_parquet(path)
+            self.assertEqual(extraction.rows_skipped_now_playing, 1)
+            self.assertEqual(frame.height, 1)
+            self.assertEqual(frame["track"].to_list(), ["Scrobbled"])
+
+    def configured_request(self, destination: str) -> RunRequest:
+        path = self.write_config(
+            self.valid_config().replace(
+                'destination = "file:///exports"',
+                f'destination = "file://{destination}"',
+            )
+        )
+        return parse_run_request(
+            ["--config", str(path)],
+            environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+        )
 
 
 def iter_clock(*values: float):
