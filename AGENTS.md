@@ -42,8 +42,9 @@ To avoid stalling implementation or failing review convergence:
   narrative body as something a human needs to configure (a test-command
   override), not as an acceptance criterion, until that override exists.
 - **A named command must already exist and be freely addable.** If a
-  criterion says running `npm run <script>` (or similar) must exit 0 with
-  no warnings, that script must already exist, or adding it must not
+  criterion says running a package script or another repository verification
+  command must exit 0 with no warnings, that command must already exist in
+  `package.json` or `.pipeline-verification-commands`, or adding it must not
   require touching a file the blast-radius classifier treats as
   shared-or-control-plane (version pins, CI workflow files, backend/provider
   blocks, and the like) — that class of change needs an operator to add the
