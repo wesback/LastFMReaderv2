@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -13,7 +14,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-import fcntl
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:
+        _msvcrt = None
+else:
+    _msvcrt = None
 
 from .client import RecentTracksWindow
 
@@ -363,12 +373,48 @@ class CheckpointStore:
     @contextmanager
     def _locked(self) -> Iterator[None]:
         self.directory.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        with self.lock_path.open("a+b") as lock_file:
+            if _fcntl is not None:
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+                return
+
+            if _msvcrt is None:
+                raise StateStoreError("no supported file-locking backend is available")
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            while True:
+                lock_file.seek(0)
+                try:
+                    _msvcrt.locking(
+                        lock_file.fileno(),
+                        _msvcrt.LK_NBLCK,
+                        1,
+                    )
+                    break
+                except OSError as error:
+                    if error.errno not in (
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EDEADLK,
+                    ):
+                        raise
+                    time.sleep(0.05)
             try:
                 yield
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.seek(0)
+                _msvcrt.locking(
+                    lock_file.fileno(),
+                    _msvcrt.LK_UNLCK,
+                    1,
+                )
 
     def _read_state(self) -> dict[str, dict[str, object]]:
         if not self.state_path.exists():

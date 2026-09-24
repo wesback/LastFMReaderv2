@@ -121,6 +121,33 @@ class PackagingTests(unittest.TestCase):
     def test_package_imports_without_configuration(self) -> None:
         self.assertEqual(lastfm_export.__version__, "0.1.0")
 
+    def test_package_import_and_cli_help_work_when_fcntl_is_unavailable(self) -> None:
+        script = """
+import sys
+
+sys.modules["fcntl"] = None
+import lastfm_export
+from lastfm_export import state
+from lastfm_export.cli import main
+
+assert state._fcntl is None
+sys.argv = ["lastfm-export", "--help"]
+try:
+    main()
+except SystemExit as error:
+    raise SystemExit(error.code)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+        self.assertIn("lastfm-export", result.stdout)
+
     def test_console_entry_point_help(self) -> None:
         output = io.StringIO()
         with patch("sys.argv", ["lastfm-export", "--help"]), redirect_stdout(output):
