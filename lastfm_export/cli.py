@@ -33,6 +33,7 @@ from .workflow import (
     ReconciliationWorkflow,
     _timestamp,
     _call_extraction,
+    select_reconciliation_workflow,
 )
 
 
@@ -573,7 +574,25 @@ def execute_run(
                     _extraction_port(user_transport, request=request)
                 )
                 landing = _landing_port(user_destination)
-                if request.full_resync:
+                get_last_full_resync_at = getattr(
+                    store,
+                    "get_last_full_resync_at",
+                    None,
+                )
+                if not callable(get_last_full_resync_at):
+                    raise TypeError(
+                        "checkpoint store must provide get_last_full_resync_at"
+                    )
+                reconciliation_workflow = select_reconciliation_workflow(
+                    explicit_full_resync=request.full_resync,
+                    last_full_resync_at=get_last_full_resync_at(username),
+                    now=started_at,
+                    cadence_days=request.config.reconciliation_cadence,
+                )
+                if (
+                    reconciliation_workflow
+                    is ReconciliationWorkflow.FULL_RESYNC
+                ):
                     coordinator = FullResyncRunCoordinator(
                         store,  # type: ignore[arg-type]
                         extraction,  # type: ignore[arg-type]
