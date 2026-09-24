@@ -798,6 +798,26 @@ class IncrementalRunCoordinatorTests(unittest.TestCase):
                     [("alice", RecentTracksWindow(expected_from, RUN_START))],
                 )
 
+    def test_pre_epoch_datetime_is_rejected_before_acquiring_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordingCheckpointStore(Path(directory))
+            coordinator = IncrementalRunCoordinator(
+                store,
+                FakeExtraction(),
+                FakeLanding(),
+                overlap_days=7,
+                clock=lambda: RUN_START,
+            )
+
+            with self.assertRaisesRegex(ValueError, "before the Unix epoch"):
+                coordinator.run(
+                    "alice",
+                    since=datetime(1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+                )
+
+            self.assertEqual(store.acquired, [])
+            self.assertEqual(store.released, [])
+
     def test_full_resync_accepts_date_only_since(self) -> None:
         end = 1_704_153_600  # 2024-01-02T00:00:00Z
         extraction = FakeExtraction()

@@ -215,6 +215,15 @@ class IncrementalRunCoordinator(Generic[Extracted]):
         the lower bound and does not receive the configured overlap.
         """
         run_start = _timestamp(self._clock(), name="run-start")
+        since_timestamp = (
+            _timestamp(since, name="since")
+            if since is not None
+            else None
+        )
+        if since_timestamp is not None and since_timestamp > run_start:
+            raise ValueError(
+                "incremental window start must not be later than run-start"
+            )
         lease = self._checkpoint_store.acquire_lease(
             username,
             ttl_seconds=self._lease_ttl_seconds,
@@ -229,8 +238,8 @@ class IncrementalRunCoordinator(Generic[Extracted]):
             checkpoint = self._checkpoint_store.get_last_successful_to(username)
             window = _window(
                 start=(
-                    _timestamp(since, name="since")
-                    if since is not None
+                    since_timestamp
+                    if since_timestamp is not None
                     else _incremental_start(
                         checkpoint,
                         overlap_seconds=self._overlap_seconds,
@@ -601,7 +610,10 @@ def _timestamp(value: Timestamp, *, name: str) -> int:
     if isinstance(value, datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
-        return int(value.astimezone(timezone.utc).timestamp())
+        value = value.astimezone(timezone.utc)
+        if value < datetime(1970, 1, 1, tzinfo=timezone.utc):
+            raise ValueError(f"{name} must not be before the Unix epoch")
+        return int(value.timestamp())
     if isinstance(value, str):
         normalized = value.strip()
         if normalized.isdigit():

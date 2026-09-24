@@ -131,6 +131,7 @@ def build_run_request(
     *,
     config_path: str | Path,
     environ: Mapping[str, str] | None = None,
+    run_start: int | None = None,
 ) -> RunRequest:
     """Build the integration-facing request from parsed CLI options."""
     since = None
@@ -139,7 +140,11 @@ def build_run_request(
         if since.endswith("Z"):
             since = f"{since[:-1]}+00:00"
         try:
-            _timestamp(since, name="since")
+            since_timestamp = _timestamp(since, name="since")
+            if run_start is None:
+                run_start = _timestamp(time.time(), name="run-start")
+            if since_timestamp > run_start:
+                raise ValueError("since must not be later than run-start")
         except (TypeError, ValueError) as error:
             raise ConfigurationError(
                 f"--since is invalid: {error}"
@@ -748,11 +753,26 @@ def main(
                 clock=clock,
                 output=output_stream,
             )
+        run_clock = clock
+        run_start = None
+        if arguments.since is not None:
+            captured_start = clock()
+            run_start = _timestamp(captured_start, name="run-start")
+            first_clock_call = True
+
+            def run_clock() -> float:
+                nonlocal first_clock_call
+                if first_clock_call:
+                    first_clock_call = False
+                    return captured_start
+                return clock()
+
         request = build_run_request(
             arguments,
             config,
             config_path=arguments.config,
             environ=environ,
+            run_start=run_start,
         )
     except ConfigurationError as error:
         print(f"configuration error: {error}", file=error_stream)
@@ -771,7 +791,7 @@ def main(
             if callable(getattr(checkpoint_store, "acquire_lease", None))
             else None
         ),
-        clock=clock,
+        clock=run_clock,
     )
 
 
