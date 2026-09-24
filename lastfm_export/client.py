@@ -181,9 +181,12 @@ class LastFMClient:
 
             try:
                 payload = self._decode_payload(response)
+                error = _api_error(payload, response)
+                if error is None:
+                    response.raise_for_status()
             except httpx.HTTPStatusError:
                 if (
-                    response.status_code not in {500, 502, 503, 504}
+                    response.status_code not in {429, 500, 502, 503, 504}
                     or attempt == self._max_retries
                 ):
                     raise
@@ -198,9 +201,7 @@ class LastFMClient:
                 )
                 continue
 
-            error = _api_error(payload, response)
             if error is None:
-                response.raise_for_status()
                 return payload
             if error.code not in RETRYABLE_ERROR_CODES:
                 raise error
