@@ -237,6 +237,88 @@ class LastFMClientTests(unittest.TestCase):
 
         self.assertEqual(delays, [2.75])
 
+    def test_http_429_plain_text_and_json_responses_retry(self) -> None:
+        for response_kwargs in (
+            {"text": "rate limited"},
+            {"json": {"message": "rate limited"}},
+        ):
+            with self.subTest(response_kwargs=response_kwargs):
+                attempts = 0
+                delays: list[float] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        return httpx.Response(429, **response_kwargs)
+                    return httpx.Response(200, json={"recenttracks": {}})
+
+                with LastFMClient(
+                    "key",
+                    transport=httpx.MockTransport(handler),
+                    sleeper=delays.append,
+                ) as client:
+                    result = client.get_recent_tracks("alice")
+
+                    self.assertEqual(client.retry_count, 1)
+                    self.assertEqual(client.retry_causes, ("http_status:429",))
+
+                self.assertEqual(result, {"recenttracks": {}})
+                self.assertEqual(attempts, 2)
+                self.assertEqual(delays, [0.4])
+
+    def test_http_429_retry_honors_retry_after(self) -> None:
+        attempts = 0
+        delays: list[float] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "2.75"},
+                    json={"message": "rate limited"},
+                )
+            return httpx.Response(200, json={"recenttracks": {}})
+
+        with LastFMClient(
+            "key",
+            transport=httpx.MockTransport(handler),
+            sleeper=delays.append,
+        ) as client:
+            client.get_recent_tracks("alice")
+
+        self.assertEqual(delays, [2.75])
+        self.assertEqual(attempts, 2)
+
+    def test_http_429_raises_last_status_error_after_retry_budget(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(429, text=f"rate limited {attempts}")
+
+        with LastFMClient(
+            "key",
+            max_retries=2,
+            transport=httpx.MockTransport(handler),
+            sleeper=lambda _: None,
+        ) as client:
+            with self.assertRaises(httpx.HTTPStatusError) as raised:
+                client.get_recent_tracks("alice")
+
+            self.assertEqual(client.retry_count, 2)
+            self.assertEqual(
+                client.retry_causes,
+                ("http_status:429", "http_status:429"),
+            )
+
+        self.assertEqual(raised.exception.response.status_code, 429)
+        self.assertEqual(raised.exception.response.text, "rate limited 3")
+        self.assertEqual(attempts, 3)
+
     def test_non_json_gateway_response_raises_last_status_error_after_retry_budget(
         self,
     ) -> None:
@@ -298,7 +380,7 @@ class LastFMClientTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, code)
 
     def test_non_json_client_error_responses_are_not_retried(self) -> None:
-        for status_code in (400, 403, 404):
+        for status_code in (400, 401, 403, 404):
             with self.subTest(status_code=status_code):
                 attempts = 0
 
@@ -316,7 +398,11 @@ class LastFMClientTests(unittest.TestCase):
                         client.get_recent_tracks("alice")
 
                 self.assertEqual(raised.exception.response.status_code, status_code)
-                self.assertEqual(attempts, 1)
+                self.assertEqual(
+                    attempts,
+                    1,
+                    f"HTTP {status_code} must make exactly one request",
+                )
 
     def test_non_retryable_api_errors_raise_without_retry(self) -> None:
         for code in (10, 26):
