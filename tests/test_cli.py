@@ -267,6 +267,8 @@ timezone = "UTC"
                 self.subTest(since=since),
                 tempfile.TemporaryDirectory() as directory,
             ):
+                store = CheckpointStore(directory)
+                self.record_full_resync(store, "alice", fixed_start - 1)
                 extraction = Mock()
                 extraction.extract.return_value = []
                 extraction.rows_extracted = 0
@@ -289,6 +291,7 @@ timezone = "UTC"
                     environ={"LASTFM_TEST_API_KEY": "test-key"},
                     transport_factory=lambda _: extraction,
                     destination_writer_factory=lambda _: writer,
+                    checkpoint_store=store,
                     clock=lambda: fixed_start,
                 )
 
@@ -448,6 +451,9 @@ timezone = "UTC"
         path = self.write_config(self.valid_config())
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            self.record_full_resync(store, "alice", 1)
+            self.record_full_resync(store, "bob", 1)
             extraction = FixtureExtraction()
             landing = FixtureLanding()
             result = main(
@@ -461,6 +467,7 @@ timezone = "UTC"
                 output=output,
                 transport_factory=lambda _: extraction,
                 destination_writer_factory=lambda _: landing,
+                checkpoint_store=store,
                 clock=iter_clock(100, 101, 102, 103, 104, 105, 106),
             )
 
@@ -598,6 +605,213 @@ timezone = "UTC"
             self.assertEqual(record["pages_fetched"], 6)
             self.assertEqual(record["retry_count"], 2)
             self.assertEqual(record["retry_causes"], ["timeout", "timeout"])
+
+    def test_normal_run_without_previous_full_resync_starts_at_unix_epoch(
+        self,
+    ) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        run_start = 1_700_000_000
+        extraction = RecordingExtraction()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            result = main(
+                ["--config", str(path), "--user", "alice"],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+                output=output,
+                transport_factory=lambda _: extraction,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=store,
+                clock=lambda: run_start,
+            )
+
+            self.assertEqual(store.get_last_full_resync_at("alice"), run_start)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(extraction.windows[0][0], "alice")
+        self.assertEqual(extraction.windows[0][1].from_timestamp, 0)
+
+    def test_normal_run_before_reconciliation_cadence_uses_incremental_coordinator(
+        self,
+    ) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        run_start = 1_700_000_000
+        completed_at = run_start - 30 * 24 * 60 * 60 + 1
+        extraction = RecordingExtraction()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            self.record_full_resync(store, "alice", completed_at)
+            checkpoint = run_start - 10 * 24 * 60 * 60
+            store.record_successful_to("alice", checkpoint)
+            result = main(
+                ["--config", str(path), "--user", "alice"],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+                output=output,
+                transport_factory=lambda _: extraction,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=store,
+                clock=lambda: run_start,
+            )
+
+            self.assertEqual(
+                store.get_last_full_resync_at("alice"),
+                completed_at,
+            )
+            self.assertEqual(
+                store.get_last_successful_to("alice"),
+                run_start,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            extraction.windows,
+            [
+                (
+                    "alice",
+                    RecentTracksWindow(
+                        run_start - 17 * 24 * 60 * 60,
+                        run_start,
+                    ),
+                )
+            ],
+        )
+
+    def test_normal_run_at_reconciliation_cadence_uses_full_resync_coordinator(
+        self,
+    ) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        run_start = 1_700_000_000
+        completed_at = run_start - 30 * 24 * 60 * 60
+        extraction = RecordingExtraction()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            self.record_full_resync(store, "alice", completed_at)
+            result = main(
+                ["--config", str(path), "--user", "alice"],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+                output=output,
+                transport_factory=lambda _: extraction,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=store,
+                clock=lambda: run_start,
+            )
+
+            self.assertEqual(store.get_last_full_resync_at("alice"), run_start)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(extraction.windows[0][0], "alice")
+        self.assertEqual(extraction.windows[0][1].from_timestamp, 0)
+        self.assertGreater(len(extraction.windows), 1)
+
+    def test_multi_user_run_selects_workflow_from_each_completion_time(
+        self,
+    ) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        run_start = 1_700_000_000
+        recent_completion = run_start - 5 * 24 * 60 * 60
+        due_completion = run_start - 30 * 24 * 60 * 60
+        extraction = RecordingExtraction()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            self.record_full_resync(store, "alice", recent_completion)
+            self.record_full_resync(store, "bob", due_completion)
+            store.record_successful_to("alice", run_start - 10 * 24 * 60 * 60)
+            result = main(
+                ["--config", str(path)],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+                output=output,
+                transport_factory=lambda _: extraction,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=store,
+                clock=lambda: run_start,
+            )
+
+            self.assertEqual(
+                store.get_last_full_resync_at("alice"),
+                recent_completion,
+            )
+            self.assertEqual(store.get_last_full_resync_at("bob"), run_start)
+
+        self.assertEqual(result, 0)
+        alice_windows = [
+            window
+            for username, window in extraction.windows
+            if username == "alice"
+        ]
+        bob_windows = [
+            window
+            for username, window in extraction.windows
+            if username == "bob"
+        ]
+        self.assertEqual(
+            alice_windows,
+            [
+                RecentTracksWindow(
+                    run_start - 17 * 24 * 60 * 60,
+                    run_start,
+                )
+            ],
+        )
+        self.assertEqual(bob_windows[0].from_timestamp, 0)
+        self.assertGreater(len(bob_windows), 1)
+
+    def test_explicit_full_resync_forces_every_selected_user(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        run_start = 1_700_000_000
+        extraction = RecordingExtraction()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            self.record_full_resync(store, "alice", run_start - 5 * 24 * 60 * 60)
+            self.record_full_resync(store, "bob", run_start - 5 * 24 * 60 * 60)
+            result = main(
+                ["--config", str(path), "--full-resync"],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+                output=output,
+                transport_factory=lambda _: extraction,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=store,
+                clock=lambda: run_start,
+            )
+
+            self.assertEqual(store.get_last_full_resync_at("alice"), run_start)
+            self.assertEqual(store.get_last_full_resync_at("bob"), run_start)
+
+        self.assertEqual(result, 0)
+        for username in ("alice", "bob"):
+            windows = [
+                window
+                for selected_user, window in extraction.windows
+                if selected_user == username
+            ]
+            self.assertGreater(len(windows), 1)
+            self.assertEqual(windows[0].from_timestamp, 0)
+
+    def record_full_resync(
+        self,
+        store: CheckpointStore,
+        username: str,
+        completed_at: int,
+    ) -> None:
+        lease = store.acquire_lease(username)
+        if lease is None:
+            self.fail(f"could not acquire checkpoint lease for {username}")
+        try:
+            store.record_full_resync_completed(
+                username,
+                completed_at,
+                lease=lease,
+            )
+        finally:
+            lease.release()
 
     def test_full_resync_initializes_watermark_reported_by_status(self) -> None:
         path = self.write_config(self.valid_config())
@@ -839,6 +1053,20 @@ class FixtureExtraction:
         window: RecentTracksWindow,
     ) -> list[str]:
         return [f"{username}-one", f"{username}-two"]
+
+
+class RecordingExtraction(FixtureExtraction):
+    def __init__(self) -> None:
+        self.windows: list[tuple[str, RecentTracksWindow]] = []
+
+    def extract(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+    ) -> list[str]:
+        self.windows.append((username, window))
+        return super().extract(username, window=window)
 
 
 class FailingExtraction(FixtureExtraction):
