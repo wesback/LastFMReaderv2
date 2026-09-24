@@ -27,6 +27,7 @@ class ExtractionPort(Protocol[Extracted]):
         *,
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> Extracted:
         """Extract records from exactly the supplied half-open window."""
 
@@ -133,12 +134,14 @@ class RecentTracksExtraction(Generic[Extracted]):
         *,
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> Extracted:
         return _call_extraction(
             self._extract,
             username,
             window=window,
             on_page=on_page,
+            on_progress=on_progress,
         )
 
 
@@ -208,6 +211,7 @@ class IncrementalRunCoordinator(Generic[Extracted]):
         username: str,
         *,
         since: Timestamp | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> RecentTracksWindow:
         """Run one user window and return the committed bounds.
 
@@ -258,6 +262,7 @@ class IncrementalRunCoordinator(Generic[Extracted]):
                 username,
                 window=window,
                 on_page=renew_for_page,
+                on_progress=on_progress,
             )
             lease = self._renew_lease(lease)
             self._landing.land(
@@ -341,6 +346,8 @@ class FullResyncRunCoordinator(Generic[Extracted]):
         *,
         start: Timestamp = 0,
         end: Timestamp | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
+        on_chunk: Callable[[int, int], None] | None = None,
     ) -> tuple[RecentTracksWindow, ...]:
         """Run or resume a full resync over the requested half-open interval."""
         if end is None:
@@ -380,10 +387,12 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                 for chunk in committed
                 if chunk in chunks and _is_closed_year_chunk(chunk)
             }
-            for chunk in chunks:
+            for chunk_number, chunk in enumerate(chunks, start=1):
                 lease = self._renew_lease(lease)
                 if chunk in committed:
                     continue
+                if on_chunk is not None:
+                    on_chunk(chunk_number, len(chunks))
 
                 def renew_for_page() -> None:
                     nonlocal lease
@@ -394,6 +403,7 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                     username,
                     window=chunk,
                     on_page=renew_for_page,
+                    on_progress=on_progress,
                 )
                 lease = self._renew_lease(lease)
                 self._landing.land(
@@ -588,8 +598,9 @@ def _call_extraction(
     *,
     window: RecentTracksWindow,
     on_page: Callable[[], None] | None,
+    on_progress: Callable[[int, int, int], None] | None = None,
 ) -> Extracted:
-    """Invoke extraction with a page hook when the port supports it."""
+    """Invoke extraction with supported page and progress hooks."""
     try:
         parameters = inspect.signature(extract).parameters.values()
     except (TypeError, ValueError):
@@ -599,9 +610,17 @@ def _call_extraction(
         or parameter.kind is parameter.VAR_KEYWORD
         for parameter in parameters
     )
+    accepts_progress = any(
+        parameter.name == "on_progress"
+        or parameter.kind is parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    arguments: dict[str, object] = {"window": window}
     if accepts_callback:
-        return extract(username, window=window, on_page=on_page)
-    return extract(username, window=window)
+        arguments["on_page"] = on_page
+    if accepts_progress and on_progress is not None:
+        arguments["on_progress"] = on_progress
+    return extract(username, **arguments)
 
 
 def _timestamp(value: Timestamp, *, name: str) -> int:
