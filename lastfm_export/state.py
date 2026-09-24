@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -343,8 +344,12 @@ class CheckpointStore:
 
     @staticmethod
     def _validate_ttl(ttl_seconds: float) -> None:
-        if isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be greater than zero")
+        if (
+            isinstance(ttl_seconds, bool)
+            or not math.isfinite(ttl_seconds)
+            or ttl_seconds <= 0
+        ):
+            raise ValueError("ttl_seconds must be finite and greater than zero")
 
     @staticmethod
     def _valid_lease_record(record: object) -> bool:
