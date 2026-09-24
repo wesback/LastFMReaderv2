@@ -224,6 +224,7 @@ class LastFMClient:
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
         on_tracks: PageTracksCallback | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> list[Mapping[str, Any]]:
         """Retrieve dated scrobbles for a fixed, bounded run window.
 
@@ -239,6 +240,7 @@ class LastFMClient:
                 window=window,
                 on_page=on_page,
                 on_tracks=on_tracks,
+                on_progress=on_progress,
             )
         finally:
             self.last_retrieval_stats = paginator.stats

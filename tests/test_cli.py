@@ -357,6 +357,160 @@ timezone = "UTC"
         self.assertIn("progress", interactive.getvalue())
         self.assertEqual(non_interactive.getvalue(), "")
 
+    def test_tty_cli_reports_each_page_with_cumulative_rows_and_eta(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        output.isatty = lambda: True
+
+        def handler(http_request: httpx.Request) -> httpx.Response:
+            page = int(http_request.url.params["page"])
+            track = {
+                "artist": {"#text": "Artist", "mbid": "artist"},
+                "album": {"#text": "Album", "mbid": "album"},
+                "name": f"Track {page}",
+                "mbid": f"track-{page}",
+                "url": f"https://last.fm/track/{page}",
+                "date": {"uts": str(100 + page), "#text": "date"},
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "recenttracks": {
+                        "track": [track],
+                        "@attr": {"totalPages": "2"},
+                    }
+                },
+            )
+
+        client = LastFMClient(
+            "fixture-api-key",
+            transport=httpx.MockTransport(handler),
+            sleeper=lambda _: None,
+            clock=lambda: 0,
+        )
+        self.addCleanup(client.close)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--since",
+                    "1970-01-01T00:00:00Z",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: client,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=CheckpointStore(directory),
+                clock=lambda: 200,
+            )
+
+        lines = output.getvalue().splitlines()
+        page_updates = [line for line in lines if "ETA " in line]
+        self.assertEqual(result, 0)
+        self.assertEqual(len(page_updates), 2)
+        self.assertIn("alice: page 1/2", page_updates[0])
+        self.assertIn("pages 1 | rows 1", page_updates[0])
+        self.assertIn("ETA unknown", page_updates[0])
+        self.assertIn("alice: page 2/2", page_updates[1])
+        self.assertIn("pages 2 | rows 2", page_updates[1])
+        self.assertIn("ETA 0", page_updates[1])
+        self.assertEqual(json.loads(lines[-1])["rows_extracted"], 2)
+
+    def test_non_tty_cli_emits_only_terminal_json_summary(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        output.isatty = lambda: False
+
+        def handler(http_request: httpx.Request) -> httpx.Response:
+            page = int(http_request.url.params["page"])
+            track = {
+                "artist": {"#text": "Artist", "mbid": "artist"},
+                "album": {"#text": "Album", "mbid": "album"},
+                "name": f"Track {page}",
+                "mbid": f"track-{page}",
+                "url": f"https://last.fm/track/{page}",
+                "date": {"uts": str(100 + page), "#text": "date"},
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "recenttracks": {
+                        "track": [track],
+                        "@attr": {"totalPages": "2"},
+                    }
+                },
+            )
+
+        client = LastFMClient(
+            "fixture-api-key",
+            transport=httpx.MockTransport(handler),
+            sleeper=lambda _: None,
+            clock=lambda: 0,
+        )
+        self.addCleanup(client.close)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--since",
+                    "1970-01-01T00:00:00Z",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: client,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=CheckpointStore(directory),
+                clock=lambda: 200,
+            )
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(result, 0)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["outcome"], "success")
+
+    def test_tty_cli_reports_full_resync_chunk_number_and_total(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        output.isatty = lambda: True
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--full-resync",
+                    "--since",
+                    "2019-01-01T00:00:00Z",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: FixtureExtraction(),
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=CheckpointStore(directory),
+                clock=lambda: 1_609_459_200,
+            )
+
+        progress_lines = output.getvalue().splitlines()
+        self.assertEqual(result, 0)
+        self.assertTrue(any("chunk 1/2" in line for line in progress_lines))
+        self.assertTrue(any("chunk 2/2" in line for line in progress_lines))
+
     def test_unknown_user_returns_nonzero(self) -> None:
         path = self.write_config(self.valid_config())
         error = io.StringIO()

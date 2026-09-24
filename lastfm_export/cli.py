@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import os
 import sys
 import time
@@ -238,6 +239,7 @@ class _ConfiguredExtraction:
         *,
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[object]:
         self.client.reset_metrics()
         self.pages_fetched = 0
@@ -279,11 +281,24 @@ class _ConfiguredExtraction:
                 or parameter.kind is parameter.VAR_KEYWORD
                 for parameter in parameters
             )
+            accepts_on_progress = any(
+                parameter.name == "on_progress"
+                or parameter.kind is parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
             arguments: dict[str, object] = {"window": window}
             if accepts_on_page:
                 arguments["on_page"] = on_page
             if accepts_on_tracks:
                 arguments["on_tracks"] = normalize_page
+            if accepts_on_progress and on_progress is not None:
+                arguments["on_progress"] = (
+                    lambda page, total_pages: on_progress(
+                        page,
+                        total_pages,
+                        len(rows),
+                    )
+                )
             tracks = self.client.get_scrobbles(
                 username,
                 **arguments,  # type: ignore[arg-type]
@@ -352,12 +367,14 @@ def _extraction_port(
                 *,
                 window: RecentTracksWindow,
                 on_page: Callable[[], None] | None = None,
+                on_progress: Callable[[int, int, int], None] | None = None,
             ) -> object:
                 return _call_extraction(
                     value,
                     username,
                     window=window,
                     on_page=on_page,
+                    on_progress=on_progress,
                 )
 
         return CallableExtraction()
@@ -402,6 +419,7 @@ class _MeasuredExtraction:
         *,
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> object:
         records: object = ()
         try:
@@ -410,6 +428,7 @@ class _MeasuredExtraction:
                 username,
                 window=window,
                 on_page=on_page,
+                on_progress=on_progress,
             )
             self.last_records = records
             return records
@@ -563,6 +582,50 @@ def execute_run(
             started_at = clock()
             extraction: object | None = None
             records: object = ()
+            progress_pages = 0
+            progress_rows = 0
+            window_rows = 0
+            window_started_at = time.monotonic()
+
+            def report_page(
+                page: int,
+                total_pages: int,
+                extracted_in_window: int,
+            ) -> None:
+                nonlocal progress_pages, progress_rows
+                nonlocal window_rows, window_started_at
+                if page == 1:
+                    window_rows = 0
+                    window_started_at = time.monotonic()
+                progress_pages += 1
+                progress_rows += max(0, extracted_in_window - window_rows)
+                window_rows = extracted_in_window
+                page_total = max(total_pages, 1)
+                if page >= page_total:
+                    eta = "0"
+                elif page > 1:
+                    elapsed = time.monotonic() - window_started_at
+                    if elapsed > 0:
+                        remaining = (page_total - page) * elapsed / (page - 1)
+                        eta = f"{max(1, math.ceil(remaining))}s"
+                    else:
+                        eta = "unknown"
+                else:
+                    eta = "unknown"
+                reporter.report(
+                    f"{username}: page {page}/{page_total} | "
+                    f"pages {progress_pages} | rows {progress_rows} | ETA {eta}"
+                )
+
+            def report_chunk(chunk_number: int, chunk_total: int) -> None:
+                nonlocal window_rows, window_started_at
+                window_rows = 0
+                window_started_at = time.monotonic()
+                reporter.report(
+                    f"{username}: full resync chunk "
+                    f"{chunk_number}/{chunk_total}"
+                )
+
             try:
                 user_transport = _factory_for_user(transport, username)
                 user_destination = (
@@ -603,6 +666,8 @@ def execute_run(
                         username,
                         start=request.since or 0,
                         end=int(started_at),
+                        on_progress=report_page,
+                        on_chunk=report_chunk,
                     )
                 else:
                     coordinator = IncrementalRunCoordinator(
@@ -612,7 +677,11 @@ def execute_run(
                         overlap_days=request.config.overlap,
                         clock=clock,
                     )
-                    coordinator.run(username, since=request.since)
+                    coordinator.run(
+                        username,
+                        since=request.since,
+                        on_progress=report_page,
+                    )
                 records = extraction.last_records
                 outcome = "success"
                 error = None

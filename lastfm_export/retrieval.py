@@ -37,6 +37,7 @@ class RecentTracksPaginator:
         window: RecentTracksWindow,
         on_page: Callable[[], None] | None = None,
         on_tracks: PageTracksCallback | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> list[Track]:
         """Fetch pages through page one’s reported ``totalPages``.
 
@@ -65,6 +66,8 @@ class RecentTracksPaginator:
             if on_tracks is not None:
                 on_tracks(tracks)
                 tracks = []
+            if on_progress is not None:
+                on_progress(1, total_pages)
 
             for page in range(2, total_pages + 1):
                 response = self._client.get_recent_tracks(
@@ -81,6 +84,8 @@ class RecentTracksPaginator:
                 else:
                     tracks.extend(page_tracks)
                 rows_skipped_now_playing += skipped
+                if on_progress is not None:
+                    on_progress(page, total_pages)
             return tracks
         finally:
             self.stats = RetrievalStats(pages_fetched, rows_skipped_now_playing)
@@ -93,6 +98,7 @@ def retrieve_scrobbles(
     window: RecentTracksWindow,
     on_page: Callable[[], None] | None = None,
     on_tracks: PageTracksCallback | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[Track]:
     """Retrieve dated scrobbles through the bounded request client."""
     return RecentTracksPaginator(client).fetch(
@@ -100,6 +106,7 @@ def retrieve_scrobbles(
         window=window,
         on_page=on_page,
         on_tracks=on_tracks,
+        on_progress=on_progress,
     )
 
 

@@ -343,12 +343,17 @@ class FullResyncRunCoordinatorTests(unittest.TestCase):
                 (chunks[0],),
             )
 
+            resumed_chunk_updates: list[tuple[int, int]] = []
             coordinator.run(
                 "alice",
                 start=interval.from_timestamp,
                 end=interval.to_timestamp,
+                on_chunk=lambda number, total: resumed_chunk_updates.append(
+                    (number, total)
+                ),
             )
 
+            self.assertEqual(resumed_chunk_updates, [(2, 3), (3, 3)])
             self.assertEqual(
                 [call[1] for call in extraction.calls],
                 [chunks[0], chunks[1], chunks[1], chunks[2]],
