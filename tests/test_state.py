@@ -4,7 +4,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from lastfm_export.client import RecentTracksWindow
 from lastfm_export.state import CheckpointStore, StateStoreError
@@ -108,6 +109,24 @@ class CheckpointStoreTests(unittest.TestCase):
             self.assertEqual(reopened.get_last_successful_to("alice"), 100)
             self.assertEqual(reopened.get_last_successful_to("bob"), 200)
 
+    def test_failed_atomic_checkpoint_replace_preserves_previous_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            store.record_successful_to("alice", 100)
+            original_state = store.state_path.read_bytes()
+
+            with (
+                patch(
+                    "lastfm_export.state.os.replace",
+                    side_effect=OSError("simulated replace failure"),
+                ),
+                self.assertRaises(StateStoreError),
+            ):
+                store.record_successful_to("alice", 200)
+
+            self.assertEqual(store.state_path.read_bytes(), original_state)
+            self.assertEqual(store.get_last_successful_to("alice"), 100)
+
     def test_leases_are_exclusive_per_user_and_expire(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CheckpointStore(Path(directory))
@@ -124,6 +143,30 @@ class CheckpointStoreTests(unittest.TestCase):
             time.sleep(0.06)
             self.assertIsNotNone(expiring)
             self.assertIsNotNone(reopened.acquire_lease("carol", ttl_seconds=1))
+
+    def test_msvcrt_backend_excludes_duplicate_user_leases_without_fcntl(self) -> None:
+        backend = SimpleNamespace(
+            LK_NBLCK=1,
+            LK_UNLCK=2,
+            locking=Mock(),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("lastfm_export.state._fcntl", None),
+                patch("lastfm_export.state._msvcrt", backend),
+            ):
+                store = CheckpointStore(directory)
+                reopened = CheckpointStore(directory)
+
+                lease = store.acquire_lease("alice", ttl_seconds=5)
+
+                self.assertIsNotNone(lease)
+                self.assertIsNone(reopened.acquire_lease("alice", ttl_seconds=5))
+
+            self.assertEqual(
+                [call.args[1] for call in backend.locking.call_args_list],
+                [backend.LK_NBLCK, backend.LK_UNLCK] * 2,
+            )
 
     def test_failed_run_does_not_replace_last_successful_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
