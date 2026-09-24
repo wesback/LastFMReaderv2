@@ -211,6 +211,93 @@ timezone = "UTC"
                 self.assertEqual(result, 2)
                 self.assertIn("--since", error.getvalue())
 
+    def test_out_of_range_since_is_rejected_during_cli_preflight(self) -> None:
+        path = self.write_config(self.valid_config())
+        fixed_start = 1_700_000_000
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "checkpoints"
+            for since in (
+                "1969-12-31T23:59:59Z",
+                "2100-01-01T00:00:00Z",
+            ):
+                for dry_run in (False, True):
+                    with self.subTest(since=since, dry_run=dry_run):
+                        transport = Mock()
+                        writer = Mock()
+                        error = io.StringIO()
+                        arguments = [
+                            "--config",
+                            str(path),
+                            "--since",
+                            since,
+                            "--state-dir",
+                            str(state_dir),
+                        ]
+                        if dry_run:
+                            arguments.append("--dry-run")
+
+                        result = main(
+                            arguments,
+                            environ={"LASTFM_TEST_API_KEY": "test-key"},
+                            error_output=error,
+                            transport_factory=transport,
+                            destination_writer_factory=writer,
+                            clock=lambda: fixed_start,
+                        )
+
+                        self.assertEqual(result, 2)
+                        self.assertIn("configuration error", error.getvalue())
+                        self.assertIn("--since", error.getvalue())
+                        transport.assert_not_called()
+                        writer.assert_not_called()
+                        self.assertFalse(state_dir.exists())
+
+    def test_since_epoch_and_run_start_are_normalized_in_export_windows(
+        self,
+    ) -> None:
+        path = self.write_config(self.valid_config())
+        fixed_start = 1_700_000_000
+        cases = (
+            ("1700000000", fixed_start),
+            ("1970-01-01T00:00:00Z", 0),
+        )
+
+        for since, expected_start in cases:
+            with (
+                self.subTest(since=since),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                extraction = Mock()
+                extraction.extract.return_value = []
+                extraction.rows_extracted = 0
+                extraction.rows_skipped_now_playing = 0
+                extraction.pages_fetched = 0
+                extraction.retry_count = 0
+                extraction.retry_causes = ()
+                writer = Mock()
+                result = main(
+                    [
+                        "--config",
+                        str(path),
+                        "--user",
+                        "alice",
+                        "--since",
+                        since,
+                        "--state-dir",
+                        directory,
+                    ],
+                    environ={"LASTFM_TEST_API_KEY": "test-key"},
+                    transport_factory=lambda _: extraction,
+                    destination_writer_factory=lambda _: writer,
+                    clock=lambda: fixed_start,
+                )
+
+                self.assertEqual(result, 0)
+                window = extraction.extract.call_args.kwargs["window"]
+                self.assertEqual(window.from_timestamp, expected_start)
+                self.assertGreaterEqual(window.from_timestamp, 0)
+                self.assertEqual(window.to_timestamp, fixed_start)
+
     def test_since_help_describes_unix_and_iso8601_formats(self) -> None:
         help_text = build_parser().format_help()
 
