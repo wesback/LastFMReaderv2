@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 import time
 import unittest
@@ -10,6 +11,57 @@ from lastfm_export.state import CheckpointStore, StateStoreError
 
 
 class CheckpointStoreTests(unittest.TestCase):
+    def test_acquire_lease_rejects_invalid_ttls_without_changing_state(self) -> None:
+        invalid_ttls = (float("nan"), float("inf"), float("-inf"), 0, -1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            store.acquire_lease("alice", ttl_seconds=5)
+            original_state = store.state_path.read_bytes()
+
+            for ttl_seconds in invalid_ttls:
+                with self.subTest(ttl_seconds=ttl_seconds):
+                    with self.assertRaises(ValueError):
+                        store.acquire_lease("bob", ttl_seconds=ttl_seconds)
+                    self.assertEqual(store.state_path.read_bytes(), original_state)
+
+    def test_renew_lease_rejects_invalid_ttls_without_changing_state(self) -> None:
+        invalid_ttls = (float("nan"), float("inf"), float("-inf"), 0, -1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            lease = store.acquire_lease("alice", ttl_seconds=5)
+            original_state = store.state_path.read_bytes()
+
+            for ttl_seconds in invalid_ttls:
+                with self.subTest(ttl_seconds=ttl_seconds):
+                    with self.assertRaises(ValueError):
+                        store.renew_lease(lease, ttl_seconds=ttl_seconds)
+                    self.assertEqual(store.state_path.read_bytes(), original_state)
+
+    def test_finite_ttls_create_and_renew_finite_json_expirations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            lease = store.acquire_lease("alice", ttl_seconds=5)
+            self.assertTrue(
+                math.isfinite(
+                    json.loads(store.state_path.read_text())["leases"]["alice"][
+                        "expires_at"
+                    ]
+                )
+            )
+
+            renewed = store.renew_lease(lease, ttl_seconds=10)
+
+            self.assertIsNotNone(renewed)
+            self.assertTrue(
+                math.isfinite(
+                    json.loads(store.state_path.read_text())["leases"]["alice"][
+                        "expires_at"
+                    ]
+                )
+            )
+
     def test_reads_legacy_interval_keyed_full_resync_state(self) -> None:
         interval = RecentTracksWindow(1_514_764_800, 1_700_000_000)
         chunk = RecentTracksWindow(1_514_764_800, 1_546_300_800)
