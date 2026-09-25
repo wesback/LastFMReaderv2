@@ -381,6 +381,7 @@ class _ConfiguredExtraction:
                         enrich_title(source_title),
                     )
                 )
+                self.rows_extracted += 1
 
         try:
             try:
@@ -423,7 +424,6 @@ class _ConfiguredExtraction:
             )
             if not accepts_on_tracks:
                 normalize_page(tracks)
-            self.rows_extracted = len(rows)
             return rows
         finally:
             retrieval_stats = self.client.last_retrieval_stats

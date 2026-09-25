@@ -993,6 +993,146 @@ timezone = "UTC"
         self.assertNotIn(secret, output.getvalue())
         self.assertEqual(record["error"]["type"], "RuntimeError")
 
+    def test_failed_later_page_summary_keeps_rows_from_prior_page(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        requested_pages: list[int] = []
+
+        def handler(http_request: httpx.Request) -> httpx.Response:
+            page = int(http_request.url.params["page"])
+            requested_pages.append(page)
+            if page == 2:
+                raise RuntimeError("fixture page 2 failure")
+            tracks = [
+                {
+                    "artist": {"#text": "Artist", "mbid": "artist"},
+                    "album": {"#text": "Album", "mbid": "album"},
+                    "name": f"Track {number}",
+                    "mbid": f"track-{number}",
+                    "url": f"https://last.fm/track/{number}",
+                    "date": {"uts": str(100 + number), "#text": "date"},
+                }
+                for number in (1, 2)
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "recenttracks": {
+                        "track": tracks,
+                        "@attr": {"totalPages": "2"},
+                    }
+                },
+            )
+
+        client = LastFMClient(
+            "fixture-api-key",
+            transport=httpx.MockTransport(handler),
+            sleeper=lambda _: None,
+            clock=lambda: 0,
+        )
+        self.addCleanup(client.close)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            store.record_successful_to("alice", 50)
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--since",
+                    "1970-01-01T00:00:00Z",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: client,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=store,
+                clock=lambda: 200,
+            )
+
+            self.assertEqual(store.get_last_successful_to("alice"), 50)
+
+        lines = output.getvalue().splitlines()
+        self.assertNotEqual(result, 0)
+        self.assertEqual(requested_pages, [1, 2])
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual(record["outcome"], "failed")
+        self.assertEqual(record["rows_extracted"], 2)
+        self.assertEqual(record["pages_fetched"], 1)
+
+    def test_successful_two_page_run_reports_all_normalized_rows(self) -> None:
+        path = self.write_config(self.valid_config())
+        output = io.StringIO()
+        requested_pages: list[int] = []
+
+        def handler(http_request: httpx.Request) -> httpx.Response:
+            page = int(http_request.url.params["page"])
+            requested_pages.append(page)
+            track_numbers = (1, 2) if page == 1 else (3, 4, 5)
+            tracks = [
+                {
+                    "artist": {"#text": "Artist", "mbid": "artist"},
+                    "album": {"#text": "Album", "mbid": "album"},
+                    "name": f"Track {number}",
+                    "mbid": f"track-{number}",
+                    "url": f"https://last.fm/track/{number}",
+                    "date": {"uts": str(100 + number), "#text": "date"},
+                }
+                for number in track_numbers
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "recenttracks": {
+                        "track": tracks,
+                        "@attr": {"totalPages": "2"},
+                    }
+                },
+            )
+
+        client = LastFMClient(
+            "fixture-api-key",
+            transport=httpx.MockTransport(handler),
+            sleeper=lambda _: None,
+            clock=lambda: 0,
+        )
+        self.addCleanup(client.close)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(directory)
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--since",
+                    "1970-01-01T00:00:00Z",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: client,
+                destination_writer_factory=lambda _: FixtureLanding(),
+                checkpoint_store=store,
+                clock=lambda: 200,
+            )
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(result, 0)
+        self.assertEqual(requested_pages, [1, 2])
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual(record["outcome"], "success")
+        self.assertEqual(record["rows_extracted"], 5)
+        self.assertEqual(record["pages_fetched"], 2)
+
     def test_full_resync_dispatches_and_accumulates_window_metrics(self) -> None:
         path = self.write_config(self.valid_config())
         output = io.StringIO()
