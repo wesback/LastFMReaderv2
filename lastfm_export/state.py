@@ -417,36 +417,7 @@ class CheckpointStore:
                 )
 
     def _read_state(self) -> dict[str, dict[str, object]]:
-        if not self.state_path.exists():
-            return {
-                "checkpoints": {},
-                "leases": {},
-                "full_resync": {},
-                "full_resync_completed_at": {},
-            }
-        try:
-            with self.state_path.open(encoding="utf-8") as state_file:
-                state = json.load(state_file)
-        except (OSError, json.JSONDecodeError) as error:
-            raise StateStoreError(f"unable to read {self.state_path}") from error
-        if (
-            not isinstance(state, dict)
-            or not isinstance(state.get("checkpoints"), dict)
-            or not isinstance(state.get("leases"), dict)
-        ):
-            raise StateStoreError(f"invalid state format in {self.state_path}")
-        # State files written before resumable full resync support are migrated
-        # in memory and receive the new keys on the next state write.
-        if "full_resync" not in state:
-            state["full_resync"] = {}
-        if "full_resync_completed_at" not in state:
-            state["full_resync_completed_at"] = {}
-        if not isinstance(state["full_resync"], dict) or not isinstance(
-            state["full_resync_completed_at"],
-            dict,
-        ):
-            raise StateStoreError(f"invalid state format in {self.state_path}")
-        return state
+        return _read_state_file(self.state_path)
 
     def _write_state(self, state: dict[str, dict[str, object]]) -> None:
         try:
@@ -468,6 +439,57 @@ class CheckpointStore:
             if "temporary_path" in locals():
                 temporary_path.unlink(missing_ok=True)
             raise StateStoreError(f"unable to write {self.state_path}") from error
+
+
+class ReadOnlyCheckpointStore:
+    """Read checkpoint watermarks without creating or locking state files."""
+
+    def __init__(self, directory: str | os.PathLike[str]) -> None:
+        self.state_path = Path(directory) / CheckpointStore._STATE_FILENAME
+        self._state = _read_state_file(self.state_path)
+
+    def get_last_successful_to(self, username: str) -> int | None:
+        """Return the last successful ``to`` value for *username*."""
+        username = CheckpointStore._validate_username(username)
+        value = self._state["checkpoints"].get(username)
+        if value is not None and not isinstance(value, int):
+            raise StateStoreError(
+                f"checkpoint for {username!r} is not an integer"
+            )
+        return value
+
+
+def _read_state_file(state_path: Path) -> dict[str, dict[str, object]]:
+    try:
+        with state_path.open(encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except FileNotFoundError:
+        return {
+            "checkpoints": {},
+            "leases": {},
+            "full_resync": {},
+            "full_resync_completed_at": {},
+        }
+    except (OSError, json.JSONDecodeError) as error:
+        raise StateStoreError(f"unable to read {state_path}") from error
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("checkpoints"), dict)
+        or not isinstance(state.get("leases"), dict)
+    ):
+        raise StateStoreError(f"invalid state format in {state_path}")
+    # State files written before resumable full resync support are migrated
+    # in memory and receive the new keys on the next state write.
+    if "full_resync" not in state:
+        state["full_resync"] = {}
+    if "full_resync_completed_at" not in state:
+        state["full_resync_completed_at"] = {}
+    if not isinstance(state["full_resync"], dict) or not isinstance(
+        state["full_resync_completed_at"],
+        dict,
+    ):
+        raise StateStoreError(f"invalid state format in {state_path}")
+    return state
 
 
 def _window_bounds(window: RecentTracksWindow) -> tuple[int, int]:
