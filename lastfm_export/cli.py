@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol, TextIO
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 from .client import LastFMClient, RecentTracksWindow
 from .config import ConfigurationError, ExporterConfig, load_config
@@ -74,6 +75,50 @@ class RunRequest:
 TransportFactory = Callable[[RunRequest], object]
 DestinationWriterFactory = Callable[[RunRequest], object]
 Clock = Callable[[], float]
+
+_CLOUD_CREDENTIAL_ENV_VARS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AZURE_STORAGE_CONNECTION_STRING",
+    "AZURE_STORAGE_KEY",
+    "AZURE_STORAGE_SAS_TOKEN",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+)
+_CREDENTIAL_URI_QUERY_KEYS = frozenset(
+    {
+        "accesskey",
+        "accountkey",
+        "accesstoken",
+        "apikey",
+        "auth",
+        "authorization",
+        "awsaccesskeyid",
+        "awssecretaccesskey",
+        "clientsecret",
+        "connectionstring",
+        "credential",
+        "credentials",
+        "key",
+        "password",
+        "passwd",
+        "refreshtoken",
+        "sas",
+        "sastoken",
+        "secret",
+        "secretaccesskey",
+        "secretkey",
+        "sharedaccesssignature",
+        "sig",
+        "signature",
+        "token",
+        "xamzsecuritytoken",
+        "xamzsignature",
+        "xamzcredential",
+    }
+)
 
 
 class CheckpointReader(Protocol):
@@ -178,14 +223,21 @@ def build_run_request(
     )
     environment = os.environ if environ is None else environ
     api_key = environment.get(config.api_key_env)
+    destinations = (
+        config.destination,
+        *(user.destination for user in config.users),
+    )
+    credential_secrets = _cloud_credential_secrets(environment, destinations)
     configured_secrets = tuple(
-        value
-        for value in (
-            api_key,
-            config.destination,
-            *(user.destination for user in config.users),
+        dict.fromkeys(
+            value
+            for value in (
+                api_key,
+                *destinations,
+                *credential_secrets,
+            )
+            if value
         )
-        if value
     )
     return RunRequest(
         config=config,
@@ -202,6 +254,65 @@ def build_run_request(
         api_key=api_key,
         secrets=configured_secrets,
     )
+
+
+def _cloud_credential_secrets(
+    environment: Mapping[str, str],
+    destinations: Sequence[str],
+) -> tuple[str, ...]:
+    """Collect supported cloud credentials without treating arbitrary env as secret."""
+    secrets: list[str] = []
+    for name in _CLOUD_CREDENTIAL_ENV_VARS:
+        value = environment.get(name)
+        if not value:
+            continue
+        secrets.append(value)
+        if name == "AZURE_STORAGE_CONNECTION_STRING":
+            for component in value.split(";"):
+                key, separator, credential = component.partition("=")
+                normalized_key = "".join(
+                    character for character in key.casefold() if character.isalnum()
+                )
+                if separator and normalized_key in {
+                    "accountkey",
+                    "sharedaccesssignature",
+                }:
+                    secrets.append(credential)
+                    if normalized_key == "sharedaccesssignature":
+                        secrets.extend(
+                            _credential_query_secrets(credential.lstrip("?"))
+                        )
+        elif name == "AZURE_STORAGE_SAS_TOKEN":
+            secrets.extend(_credential_query_secrets(value.lstrip("?")))
+
+    for destination in destinations:
+        try:
+            parsed = urlsplit(destination)
+        except ValueError:
+            query = destination.partition("?")[2].partition("#")[0]
+            secrets.extend(_credential_query_secrets(query))
+            continue
+        if parsed.username is not None:
+            secrets.extend((parsed.username, unquote(parsed.username)))
+        if parsed.password is not None:
+            secrets.extend((parsed.password, unquote(parsed.password)))
+        secrets.extend(_credential_query_secrets(parsed.query))
+    return tuple(dict.fromkeys(secret for secret in secrets if secret))
+
+
+def _credential_query_secrets(query: str) -> list[str]:
+    """Return raw and decoded values for credential-bearing query parameters."""
+    secrets: list[str] = []
+    for component in query.split("&"):
+        key, separator, value = component.partition("=")
+        normalized_key = "".join(
+            character
+            for character in unquote_plus(key).casefold()
+            if character.isalnum()
+        )
+        if separator and normalized_key in _CREDENTIAL_URI_QUERY_KEYS and value:
+            secrets.extend((value, unquote_plus(value)))
+    return secrets
 
 
 def parse_run_request(
