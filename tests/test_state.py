@@ -8,10 +8,41 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from lastfm_export.client import RecentTracksWindow
-from lastfm_export.state import CheckpointStore, StateStoreError
+from lastfm_export.state import (
+    CheckpointStore,
+    ReadOnlyCheckpointStore,
+    StateStoreError,
+)
 
 
 class CheckpointStoreTests(unittest.TestCase):
+    def test_read_only_store_surfaces_uninspectable_state_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text("{}")
+            original_open = Path.open
+
+            def deny_state_file_read(
+                path: Path,
+                *args: object,
+                **kwargs: object,
+            ):
+                if path == state_path:
+                    raise PermissionError("state directory is not readable")
+                return original_open(path, *args, **kwargs)
+
+            with (
+                patch.object(Path, "exists", return_value=False),
+                patch.object(Path, "open", new=deny_state_file_read),
+            ):
+                with self.assertRaisesRegex(
+                    StateStoreError,
+                    "unable to read",
+                ) as raised:
+                    ReadOnlyCheckpointStore(directory)
+
+            self.assertIsInstance(raised.exception.__cause__, PermissionError)
+
     def test_acquire_lease_rejects_invalid_ttls_without_changing_state(self) -> None:
         invalid_ttls = (float("nan"), float("inf"), float("-inf"), 0, -1)
 

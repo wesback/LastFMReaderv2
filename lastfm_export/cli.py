@@ -29,7 +29,7 @@ from .output import (
     write_landing,
 )
 from .progress import ProgressReporter
-from .state import CheckpointStore, StateStoreError
+from .state import CheckpointStore, ReadOnlyCheckpointStore, StateStoreError
 from .titles import enrich_title
 from .workflow import (
     CheckpointPort,
@@ -919,7 +919,7 @@ def _checkpoint_store_for_status(
         if state_dir is not None
         else config_path.parent / ".lastfm-export"
     )
-    return CheckpointStore(directory)
+    return ReadOnlyCheckpointStore(directory)
 
 
 def main(
