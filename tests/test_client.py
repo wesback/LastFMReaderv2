@@ -237,6 +237,34 @@ class LastFMClientTests(unittest.TestCase):
 
         self.assertEqual(delays, [2.75])
 
+    def test_non_finite_retry_after_uses_exponential_backoff(self) -> None:
+        for retry_after in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(retry_after=retry_after):
+                attempts = 0
+                delays: list[float] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        return httpx.Response(
+                            503,
+                            headers={"Retry-After": retry_after},
+                            text="gateway failure",
+                        )
+                    return httpx.Response(200, json={"recenttracks": {}})
+
+                with LastFMClient(
+                    "key",
+                    retry_delay=0.8,
+                    transport=httpx.MockTransport(handler),
+                    sleeper=delays.append,
+                ) as client:
+                    client.get_recent_tracks("alice")
+
+                self.assertEqual(attempts, 2)
+                self.assertEqual(delays, [0.8])
+
     def test_http_429_plain_text_and_json_responses_retry(self) -> None:
         for response_kwargs in (
             {"text": "rate limited"},
