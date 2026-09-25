@@ -16,6 +16,10 @@ acceptance reviewer verify once the issue is labeled `type:story`. Ask what's ne
 pin that down rather than guessing.
 
 **Acceptance criteria rules for stories and bug reports:**
+These rules govern every acceptance-criteria draft for this repo
+however it's produced — by hand, or via an installed skill like
+`/to-spec` or `/to-tickets`. Neither knows this pipeline's rules on its
+own; apply them on top of whatever template the skill uses.
 Criteria are evaluated by an automated runner and an independent
 acceptance reviewer against the test output and diff of a single worktree.
 To avoid stalling implementation or failing review convergence:
