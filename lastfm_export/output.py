@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import posixpath
 import shutil
+import stat
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
@@ -30,6 +31,10 @@ _FORMAT_ALIASES = {
     "ndjson": ("jsonl", "json lines"),
     "parquet": ("parquet", "parquet"),
 }
+
+
+class DestinationValidationError(RuntimeError):
+    """Redacted, safe-to-display failure while checking a configured destination."""
 
 
 class LocalLandingWriter:
@@ -59,6 +64,10 @@ class LocalLandingWriter:
             / f"month={boundary:%m}"
             / f"{username}_{from_timestamp}_{to_timestamp}.{extension}"
         )
+
+    def validate(self) -> None:
+        """Check the nearest existing destination directory without creating it."""
+        _validate_local_path(self.destination)
 
     def write(
         self,
@@ -120,6 +129,18 @@ class FsspecLandingWriter:
         self.destination = destination
         self._filesystem, self._root = fsspec.core.url_to_fs(destination)
         self.format = _format_name(format)
+
+    def validate(self) -> None:
+        """Initialize the adapter and perform a read-only destination check."""
+        if urlsplit(self.destination).scheme == "file":
+            _validate_local_path(Path(self._root))
+            return
+
+        root = str(self._root).strip("/")
+        resource = root.split("/", 1)[0].split("@", 1)[0]
+        if not resource:
+            raise ValueError("destination URI must identify a bucket or container")
+        self._filesystem.info(resource)
 
     def path(
         self,
@@ -214,6 +235,40 @@ def write_landing(
         window,
         rows,
     )
+
+
+def validate_landing_destination(destination: str | Path) -> None:
+    """Validate a local path or cloud bucket/container without writing data."""
+    value = str(destination)
+    try:
+        if urlsplit(value).scheme in FsspecLandingWriter._SUPPORTED_SCHEMES:
+            FsspecLandingWriter(value).validate()
+            return
+        LocalLandingWriter(destination).validate()
+    except Exception as error:
+        raise DestinationValidationError(
+            f"destination validation failed ({type(error).__name__})"
+        ) from error
+
+
+def _validate_local_path(destination: Path) -> None:
+    candidate = destination
+    while True:
+        if candidate.is_symlink() and not candidate.exists():
+            candidate.stat()
+        try:
+            metadata = candidate.stat()
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                raise
+            candidate = parent
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(
+                f"local destination ancestor is not a directory: {candidate}"
+            )
+        return
 
 
 def _local_destination(destination: str | Path) -> Path:
@@ -374,10 +429,12 @@ LocalDestinationWriter = LocalLandingWriter
 
 __all__ = [
     "FsspecLandingWriter",
+    "DestinationValidationError",
     "LocalDestinationWriter",
     "LocalLandingWriter",
     "NORMALIZED_COLUMNS",
     "NormalizedRecord",
     "NormalizedRows",
     "write_landing",
+    "validate_landing_destination",
 ]
