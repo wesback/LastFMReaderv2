@@ -22,7 +22,11 @@ from .logging import (
     exception_log_record,
     serialize_run_summary,
 )
-from .output import write_landing
+from .output import (
+    DestinationValidationError,
+    validate_landing_destination,
+    write_landing,
+)
 from .progress import ProgressReporter
 from .state import CheckpointStore, StateStoreError
 from .titles import enrich_title
@@ -112,7 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="validate configuration and credentials without reading or writing data",
+        help=(
+            "validate configuration, credentials, and destination connectivity "
+            "without Last.fm requests or file writes"
+        ),
     )
     parser.add_argument(
         "--full-resync",
@@ -532,7 +539,33 @@ def execute_run(
 ) -> int:
     """Execute every selected user and emit one terminal summary per user."""
     if request.dry_run:
-        return 0
+        output_stream = output if output is not None else sys.stdout
+        failures = 0
+        for username in request.selected_users:
+            started_at = clock()
+            try:
+                user = request.config.user(username)
+                validate_landing_destination(user.destination)
+                outcome = "success"
+                error = None
+            except DestinationValidationError as caught:
+                failures += 1
+                outcome = "failed"
+                error = caught
+            ended_at = clock()
+            print(
+                _summary(
+                    username,
+                    outcome=outcome,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    extraction=None,
+                    error=error,
+                    secrets=request.secrets,
+                ),
+                file=output_stream,
+            )
+        return 1 if failures else 0
 
     reporter = ProgressReporter(output)
     reporter.report(f"Exporting {', '.join(request.selected_users)}")

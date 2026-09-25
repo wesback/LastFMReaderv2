@@ -23,6 +23,28 @@ from lastfm_export.client import LastFMClient, RecentTracksWindow
 from lastfm_export.workflow import ReconciliationWorkflow
 
 
+class MetadataFilesystem:
+    def __init__(self, failure: BaseException | None = None) -> None:
+        self.failure = failure
+        self.metadata_requests: list[str] = []
+        self.write_requests: list[str] = []
+
+    def info(self, path: str) -> dict[str, str]:
+        self.metadata_requests.append(path)
+        if self.failure is not None:
+            raise self.failure
+        return {"name": path}
+
+    def makedirs(self, path: str, exist_ok: bool = False) -> None:
+        del exist_ok
+        self.write_requests.append(path)
+
+    def open(self, path: str, mode: str) -> None:
+        del mode
+        self.write_requests.append(path)
+        raise AssertionError("dry-run must not open destination objects")
+
+
 class CliTests(unittest.TestCase):
     def write_config(self, text: str) -> Path:
         directory = tempfile.TemporaryDirectory()
@@ -89,19 +111,272 @@ timezone = "UTC"
         self.assertEqual(error.getvalue(), "")
 
     def test_dry_run_does_not_call_transport_or_destination_writer(self) -> None:
-        path = self.write_config(self.valid_config())
-        transport = Mock()
-        writer = Mock()
-        result = main(
-            ["--config", str(path), "--dry-run"],
-            environ={"LASTFM_TEST_API_KEY": "test-key"},
-            transport_factory=transport,
-            destination_writer_factory=writer,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "landing"
+            state_dir = Path(directory) / "state"
+            path = self.write_config(
+                self.valid_config().replace(
+                    'destination = "file:///exports"',
+                    f'destination = "{destination}"',
+                )
+            )
+            requests: list[httpx.Request] = []
+            client = LastFMClient(
+                "test-key",
+                transport=httpx.MockTransport(
+                    lambda request: requests.append(request)
+                    or httpx.Response(500)
+                ),
+            )
+            self.addCleanup(client.close)
+            transport = Mock(return_value=client)
+            writer = Mock()
+            output = io.StringIO()
+
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--dry-run",
+                    "--state-dir",
+                    str(state_dir),
+                ],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+                output=output,
+                transport_factory=transport,
+                destination_writer_factory=writer,
+            )
 
         self.assertEqual(result, 0)
+        self.assertEqual(
+            [json.loads(line)["username"] for line in output.getvalue().splitlines()],
+            ["alice", "bob"],
+        )
+        self.assertEqual(requests, [])
+        self.assertFalse(destination.exists())
+        self.assertFalse(state_dir.exists())
+        self.assertFalse((path.parent / ".lastfm-export").exists())
         transport.assert_not_called()
         writer.assert_not_called()
+
+    def test_dry_run_rejects_local_destination_beneath_a_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            blocked_parent = Path(directory) / "not-a-directory"
+            blocked_parent.write_text("occupied", encoding="utf-8")
+            destination = Path(directory) / "landing"
+            blocked_destination = blocked_parent / "landing"
+            path = self.write_config(
+                self.valid_config().replace(
+                    'destination = "file:///exports"',
+                    f'destination = "{destination}"',
+                ).replace(
+                    'username = "bob"\ntimezone = "UTC"',
+                    'username = "bob"\ntimezone = "UTC"\n'
+                    f'destination = "{blocked_destination}"',
+                )
+            )
+            output = io.StringIO()
+            state_dir = Path(directory) / "state"
+            requests: list[httpx.Request] = []
+            client = LastFMClient(
+                "test-key",
+                transport=httpx.MockTransport(
+                    lambda request: requests.append(request)
+                    or httpx.Response(500)
+                ),
+            )
+            self.addCleanup(client.close)
+            transport = Mock(return_value=client)
+
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--dry-run",
+                    "--state-dir",
+                    str(state_dir),
+                ],
+                environ={"LASTFM_TEST_API_KEY": "test-key"},
+                output=output,
+                transport_factory=transport,
+            )
+
+        self.assertNotEqual(result, 0)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            [(record["username"], record["outcome"]) for record in records],
+            [("alice", "success"), ("bob", "failed")],
+        )
+        self.assertEqual(requests, [])
+        self.assertFalse(destination.exists())
+        self.assertFalse(blocked_destination.exists())
+        self.assertFalse(state_dir.exists())
+        self.assertFalse((path.parent / ".lastfm-export").exists())
+        transport.assert_not_called()
+
+    def test_dry_run_checks_cloud_metadata_without_requiring_landing_prefix(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            path = self.write_config(
+                self.valid_config()
+                .replace(
+                    'destination = "file:///exports"',
+                    'destination = "s3://alice-bucket/missing/landing"',
+                )
+                .replace(
+                    'username = "bob"\ntimezone = "UTC"',
+                    'username = "bob"\ntimezone = "UTC"\n'
+                    'destination = "az://bob-container/missing/landing"',
+                )
+                + '\n[[users]]\nusername = "carol"\ntimezone = "UTC"\n'
+                'destination = "abfss://carol-container@account.dfs.core.windows.net/'
+                'missing/landing"\n'
+            )
+            filesystem = MetadataFilesystem()
+            transport = Mock()
+            output = io.StringIO()
+
+            def resolve(uri: str) -> tuple[MetadataFilesystem, str]:
+                return filesystem, uri.split("://", 1)[1]
+
+            with patch("fsspec.core.url_to_fs", side_effect=resolve) as resolver:
+                result = main(
+                    [
+                        "--config",
+                        str(path),
+                        "--dry-run",
+                        "--state-dir",
+                        str(state_dir),
+                    ],
+                    environ={"LASTFM_TEST_API_KEY": "test-key"},
+                    output=output,
+                    transport_factory=transport,
+                )
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [(record["username"], record["outcome"]) for record in records],
+            [("alice", "success"), ("bob", "success"), ("carol", "success")],
+        )
+        self.assertEqual(
+            filesystem.metadata_requests,
+            ["alice-bucket", "bob-container", "carol-container"],
+        )
+        self.assertEqual(filesystem.write_requests, [])
+        self.assertFalse(state_dir.exists())
+        self.assertEqual(resolver.call_count, 3)
+        transport.assert_not_called()
+
+    def test_dry_run_reports_redacted_adapter_and_metadata_failures(
+        self,
+    ) -> None:
+        secret = "credential-value-that-must-not-appear"
+        failures = (
+            ("adapter", ImportError(f"optional adapter missing: {secret}")),
+            ("metadata", OSError(f"container metadata denied: {secret}")),
+        )
+        for failure_stage, failure in failures:
+            with (
+                self.subTest(failure_stage=failure_stage),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = self.write_config(
+                    self.valid_config().replace(
+                        'destination = "file:///exports"',
+                        'destination = "s3://private-bucket/landing"',
+                    )
+                )
+                state_dir = Path(directory) / "state"
+                filesystem = MetadataFilesystem(
+                    failure if failure_stage == "metadata" else None
+                )
+                output = io.StringIO()
+                transport = Mock()
+
+                def resolve(
+                    _: str,
+                ) -> tuple[MetadataFilesystem, str]:
+                    if failure_stage == "adapter":
+                        raise failure
+                    return filesystem, "private-bucket/landing"
+
+                with patch("fsspec.core.url_to_fs", side_effect=resolve):
+                    result = main(
+                        [
+                            "--config",
+                            str(path),
+                            "--user",
+                            "alice",
+                            "--dry-run",
+                            "--state-dir",
+                            str(state_dir),
+                        ],
+                        environ={"LASTFM_TEST_API_KEY": "test-key"},
+                        output=output,
+                        transport_factory=transport,
+                    )
+
+                record = json.loads(output.getvalue())
+                self.assertNotEqual(result, 0)
+                self.assertEqual(record["outcome"], "failed")
+                self.assertIn("error", record)
+                self.assertIn(
+                    "destination validation failed",
+                    record["error"]["message"],
+                )
+                self.assertNotIn(secret, output.getvalue())
+                self.assertEqual(filesystem.write_requests, [])
+                self.assertFalse(state_dir.exists())
+                transport.assert_not_called()
+
+    def test_dry_run_redacts_credential_resolution_failure_during_adapter_initialization(
+        self,
+    ) -> None:
+        secret = "credential-value-that-must-not-appear"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                self.valid_config().replace(
+                    'destination = "file:///exports"',
+                    'destination = "s3://private-bucket/landing"',
+                )
+            )
+            state_dir = Path(directory) / "state"
+            output = io.StringIO()
+            transport = Mock()
+
+            def resolve(_: str) -> tuple[MetadataFilesystem, str]:
+                raise RuntimeError(f"credentials unavailable: {secret}")
+
+            with patch(
+                "fsspec.core.url_to_fs",
+                side_effect=resolve,
+            ) as resolver:
+                result = main(
+                    [
+                        "--config",
+                        str(path),
+                        "--user",
+                        "alice",
+                        "--dry-run",
+                        "--state-dir",
+                        str(state_dir),
+                    ],
+                    environ={"LASTFM_TEST_API_KEY": "test-key"},
+                    output=output,
+                    transport_factory=transport,
+                )
+
+        record = json.loads(output.getvalue())
+        self.assertNotEqual(result, 0)
+        self.assertEqual(record["outcome"], "failed")
+        self.assertIn("destination validation failed", record["error"]["message"])
+        self.assertNotIn(secret, output.getvalue())
+        resolver.assert_called_once_with("s3://private-bucket/landing")
+        self.assertFalse(state_dir.exists())
+        transport.assert_not_called()
 
     def test_parquet_file_uri_is_valid_under_dry_run(self) -> None:
         path = self.write_config(
