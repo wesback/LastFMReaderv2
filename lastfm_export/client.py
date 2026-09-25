@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
-from math import nextafter
+from math import isfinite, nextafter
 from typing import Any
 
 import httpx
@@ -338,13 +338,16 @@ def _retry_after_seconds(
     if value is None:
         return None
     try:
-        return max(0.0, float(value))
+        delay = float(value)
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(value).timestamp()
         except (TypeError, ValueError, OverflowError):
             return None
         return max(0.0, retry_at - now)
+    if not isfinite(delay):
+        return None
+    return max(0.0, delay)
 
 
 __all__ = [
