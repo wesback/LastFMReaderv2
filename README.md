@@ -42,6 +42,10 @@ Run the test suite from the repository root with:
 make test
 ```
 
+The deterministic story pipeline runs the same suite as
+`python -m tests.runner`, configured in `.pipeline-test-command`, so its test
+evidence names the command used by story acceptance criteria.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local test requirements, branch and

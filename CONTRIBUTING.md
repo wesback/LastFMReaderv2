@@ -11,6 +11,9 @@ Run the complete test suite from the repository root:
 make test
 ```
 
+The deterministic story pipeline runs the same suite directly as
+`python -m tests.runner` through `.pipeline-test-command`.
+
 Do not open a pull request until the command passes. Include relevant test
 coverage for behavioral changes and describe the user-visible effect in the
 pull request.
