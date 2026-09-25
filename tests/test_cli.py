@@ -3,6 +3,7 @@ import json
 import tempfile
 import tracemalloc
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -14,10 +15,12 @@ from lastfm_export.cli import (
     RunRequest,
     _ConfiguredExtraction,
     _ConfiguredLanding,
+    build_run_request,
     build_parser,
     main,
     parse_run_request,
 )
+from lastfm_export.config import load_config
 from lastfm_export.state import CheckpointStore
 from lastfm_export.client import LastFMClient, RecentTracksWindow
 from lastfm_export.workflow import ReconciliationWorkflow
@@ -1332,6 +1335,127 @@ timezone = "UTC"
 
         self.assertNotEqual(result, 0)
         client.close.assert_called_once_with()
+
+    def test_setup_failure_redacts_cloud_credential_environment_values(self) -> None:
+        path = self.write_config(self.valid_config())
+        cases = (
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                "fixture-aws-secret-access-key",
+                (),
+            ),
+            (
+                "AZURE_STORAGE_CONNECTION_STRING",
+                "DefaultEndpointsProtocol=https;AccountName=fixture;"
+                "AccountKey=fixture-azure-account-key",
+                ("fixture-azure-account-key",),
+            ),
+        )
+        for environment_name, secret, additional_secrets in cases:
+            with self.subTest(environment_name=environment_name):
+                output = io.StringIO()
+                exception_message = (
+                    "destination initialization failed: safe diagnostic "
+                    f"({secret}) {' '.join(additional_secrets)}"
+                )
+                result = main(
+                    ["--config", str(path), "--user", "alice"],
+                    environ={
+                        "LASTFM_TEST_API_KEY": "fixture-api-key",
+                        environment_name: secret,
+                    },
+                    output=output,
+                    transport_factory=lambda _: FixtureExtraction(),
+                    destination_writer_factory=Mock(
+                        side_effect=RuntimeError(
+                            exception_message
+                        )
+                    ),
+                    clock=iter_clock(100, 101),
+                )
+
+                summary = output.getvalue()
+                record = json.loads(summary)
+                self.assertNotEqual(result, 0)
+                for credential in (secret, *additional_secrets):
+                    self.assertNotIn(credential, summary)
+                self.assertEqual(record["outcome"], "failed")
+                self.assertEqual(record["error"]["type"], "RuntimeError")
+                self.assertIn(
+                    "destination initialization failed: safe diagnostic",
+                    record["error"]["message"],
+                )
+
+    def test_user_destination_failure_redacts_uri_signature_parameter_value(
+        self,
+    ) -> None:
+        secret = "fixture-uri-signature"
+        destination = f"az://account/container?sig={secret}"
+        path = self.write_config(
+            self.valid_config().replace(
+                'username = "alice"\ntimezone = "UTC"',
+                f'username = "alice"\ntimezone = "UTC"\ndestination = "{destination}"',
+            )
+        )
+        output = io.StringIO()
+
+        class FailingDestination:
+            def land(
+                self,
+                username: str,
+                *,
+                window: RecentTracksWindow,
+                records: list[str],
+            ) -> None:
+                raise RuntimeError(
+                    f"cloud write failed: safe diagnostic; signature {secret}"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = main(
+                [
+                    "--config",
+                    str(path),
+                    "--user",
+                    "alice",
+                    "--state-dir",
+                    directory,
+                ],
+                environ={"LASTFM_TEST_API_KEY": "fixture-api-key"},
+                output=output,
+                transport_factory=lambda _: FixtureExtraction(),
+                destination_writer_factory=lambda _: FailingDestination(),
+            )
+
+        summary = output.getvalue()
+        record = json.loads(summary)
+        self.assertNotEqual(result, 0)
+        self.assertNotIn(secret, summary)
+        self.assertEqual(record["outcome"], "failed")
+        self.assertEqual(record["error"]["type"], "RuntimeError")
+        self.assertIn(
+            "cloud write failed: safe diagnostic",
+            record["error"]["message"],
+        )
+
+    def test_request_construction_handles_invalid_bracketed_destination(self) -> None:
+        path = self.write_config(self.valid_config())
+        environment = {"LASTFM_TEST_API_KEY": "fixture-api-key"}
+        config = replace(
+            load_config(path, environ=environment),
+            destination="s3://[invalid?sig=fixture-uri-signature",
+        )
+        arguments = build_parser().parse_args(["--config", str(path)])
+
+        request = build_run_request(
+            arguments,
+            config,
+            config_path=path,
+            environ=environment,
+        )
+
+        self.assertIn("s3://[invalid?sig=fixture-uri-signature", request.secrets)
+        self.assertIn("fixture-uri-signature", request.secrets)
 
     def test_configured_extraction_lands_20000_rows_without_raw_payload_retention(
         self,
