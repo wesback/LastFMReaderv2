@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
 from math import ceil, isfinite
+from threading import Event, Lock, Thread
 from typing import Generic, Protocol, TypeVar
 
 from .client import RecentTracksWindow
@@ -111,6 +112,61 @@ class IncrementalRunError(RuntimeError):
 
 class FullResyncRunError(RuntimeError):
     """Raised when a full resync cannot acquire or retain its user lease."""
+
+
+class _LeaseHeartbeat:
+    """Renew a lease periodically while a coordinator may be blocked."""
+
+    def __init__(
+        self,
+        lease: Lease,
+        ttl_seconds: float,
+        lost_error: Callable[[], Exception],
+    ) -> None:
+        self._lease = lease
+        self._ttl_seconds = ttl_seconds
+        self._lost_error = lost_error
+        self._interval = ttl_seconds / 3
+        self._stop = Event()
+        self._lock = Lock()
+        self._lost = False
+        self._failure: Exception | None = None
+        self._thread: Thread | None = None
+
+    def start(self) -> None:
+        self._thread = Thread(target=self._renew_until_stopped, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.ident is not None:
+            self._thread.join()
+
+    def renew(self) -> Lease:
+        with self._lock:
+            if self._failure is not None:
+                raise self._failure
+            if self._lost:
+                raise self._lost_error()
+            try:
+                renewed = self._lease.renew(self._ttl_seconds)
+            except Exception as error:
+                self._failure = error
+                self._stop.set()
+                raise
+            if renewed is None:
+                self._lost = True
+                self._stop.set()
+                raise self._lost_error()
+            self._lease = renewed
+            return renewed
+
+    def _renew_until_stopped(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                self.renew()
+            except Exception:
+                return
 
 
 class ReconciliationWorkflow(str, Enum):
@@ -237,8 +293,16 @@ class IncrementalRunCoordinator(Generic[Extracted]):
                 f"an incremental run is already active for {username!r}"
             )
 
+        heartbeat = _LeaseHeartbeat(
+            lease,
+            self._lease_ttl_seconds,
+            lambda: IncrementalRunError(
+                "incremental run lease expired or was lost"
+            ),
+        )
         try:
-            lease = self._renew_lease(lease)
+            heartbeat.start()
+            lease = heartbeat.renew()
             checkpoint = self._checkpoint_store.get_last_successful_to(username)
             window = _window(
                 start=(
@@ -251,11 +315,11 @@ class IncrementalRunCoordinator(Generic[Extracted]):
                 ),
                 end=run_start,
             )
-            lease = self._renew_lease(lease)
+            lease = heartbeat.renew()
 
             def renew_for_page() -> None:
                 nonlocal lease
-                lease = self._renew_lease(lease)
+                lease = heartbeat.renew()
 
             records = _call_extraction(
                 self._extraction.extract,
@@ -264,13 +328,13 @@ class IncrementalRunCoordinator(Generic[Extracted]):
                 on_page=renew_for_page,
                 on_progress=on_progress,
             )
-            lease = self._renew_lease(lease)
+            lease = heartbeat.renew()
             self._landing.land(
                 username,
                 window=window,
                 records=records,
             )
-            lease = self._renew_lease(lease)
+            lease = heartbeat.renew()
             self._checkpoint_store.record_successful_to(
                 username,
                 window.to_timestamp,
@@ -278,13 +342,8 @@ class IncrementalRunCoordinator(Generic[Extracted]):
             )
             return window
         finally:
+            heartbeat.stop()
             lease.release()
-
-    def _renew_lease(self, lease: Lease) -> Lease:
-        renewed = lease.renew(self._lease_ttl_seconds)
-        if renewed is None:
-            raise IncrementalRunError("incremental run lease expired or was lost")
-        return renewed
 
 
 def run_incremental(
@@ -365,8 +424,16 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                 f"an export run is already active for {username!r}"
             )
 
+        heartbeat = _LeaseHeartbeat(
+            lease,
+            self._lease_ttl_seconds,
+            lambda: FullResyncRunError(
+                "full resync lease expired or was lost"
+            ),
+        )
         try:
-            lease = self._renew_lease(lease)
+            heartbeat.start()
+            lease = heartbeat.renew()
             checkpoint = self._checkpoint_store.get_last_successful_to(username)
             completed_at = self._checkpoint_store.get_last_full_resync_at(
                 username
@@ -388,7 +455,7 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                 if chunk in chunks and _is_closed_year_chunk(chunk)
             }
             for chunk_number, chunk in enumerate(chunks, start=1):
-                lease = self._renew_lease(lease)
+                lease = heartbeat.renew()
                 if chunk in committed:
                     continue
                 if on_chunk is not None:
@@ -396,7 +463,7 @@ class FullResyncRunCoordinator(Generic[Extracted]):
 
                 def renew_for_page() -> None:
                     nonlocal lease
-                    lease = self._renew_lease(lease)
+                    lease = heartbeat.renew()
 
                 records = _call_extraction(
                     self._extraction.extract,
@@ -405,13 +472,13 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                     on_page=renew_for_page,
                     on_progress=on_progress,
                 )
-                lease = self._renew_lease(lease)
+                lease = heartbeat.renew()
                 self._landing.land(
                     username,
                     window=chunk,
                     records=records,
                 )
-                lease = self._renew_lease(lease)
+                lease = heartbeat.renew()
                 self._checkpoint_store.record_committed_full_resync_chunk(
                     username,
                     interval=interval,
@@ -423,13 +490,13 @@ class FullResyncRunCoordinator(Generic[Extracted]):
                 checkpoint,
                 interval=interval,
             ):
-                lease = self._renew_lease(lease)
+                lease = heartbeat.renew()
                 self._checkpoint_store.record_successful_to(
                     username,
                     interval.to_timestamp,
                     lease=lease,
                 )
-            lease = self._renew_lease(lease)
+            lease = heartbeat.renew()
             self._checkpoint_store.record_full_resync_completed(
                 username,
                 _timestamp(self._clock(), name="full-resync completion"),
@@ -437,13 +504,8 @@ class FullResyncRunCoordinator(Generic[Extracted]):
             )
             return chunks
         finally:
+            heartbeat.stop()
             lease.release()
-
-    def _renew_lease(self, lease: Lease) -> Lease:
-        renewed = lease.renew(self._lease_ttl_seconds)
-        if renewed is None:
-            raise FullResyncRunError("full resync lease expired or was lost")
-        return renewed
 
 
 # Keep the shorter name available for callers that treat reconciliation as a

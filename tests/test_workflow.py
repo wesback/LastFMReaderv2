@@ -1,16 +1,22 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from lastfm_export.client import RecentTracksWindow
+import httpx
+
+from lastfm_export.client import LastFMClient, RecentTracksWindow
 from lastfm_export.state import CheckpointStore, Lease
 from lastfm_export.workflow import (
     FullResyncRunCoordinator,
     IncrementalRunCoordinator,
     IncrementalRunError,
+    RecentTracksExtraction,
     ReconciliationWorkflow,
     calendar_year_chunks,
     select_reconciliation_workflow,
@@ -20,6 +26,112 @@ from lastfm_export.workflow import (
 RUN_START = 1_768_867_200  # 2026-01-20T00:00:00Z
 WATERMARK = 1_768_003_200  # 2026-01-10T00:00:00Z
 EXPECTED_FROM = 1_767_398_400  # 2026-01-03T00:00:00Z
+
+
+def _assert_lease_held_while_blocked(
+    test_case: unittest.TestCase,
+    store: CheckpointStore,
+    blocked: threading.Event,
+    unblock: threading.Event,
+    run: Callable[[], object],
+    *,
+    ttl_seconds: float,
+) -> None:
+    errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            run()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    try:
+        test_case.assertTrue(blocked.wait(timeout=2))
+        time.sleep(ttl_seconds * 2)
+        test_case.assertIsNone(
+            store.acquire_lease("alice", ttl_seconds=ttl_seconds)
+        )
+    finally:
+        unblock.set()
+        thread.join(timeout=3)
+
+    test_case.assertFalse(thread.is_alive(), "coordinator did not finish")
+    if errors:
+        raise errors[0]
+
+    available_lease = store.acquire_lease("alice", ttl_seconds=ttl_seconds)
+    test_case.assertIsNotNone(available_lease)
+    if available_lease is not None:
+        available_lease.release()
+
+
+def _retrying_extraction(
+    entered: threading.Event,
+) -> tuple[LastFMClient, RecentTracksExtraction[object], list[float]]:
+    attempts = 0
+    delays: list[float] = []
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                200,
+                json={"error": 8, "message": "temporary failure"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "recenttracks": {
+                    "track": [],
+                    "@attr": {"totalPages": "1"},
+                }
+            },
+        )
+
+    def sleep_for_retry(delay: float) -> None:
+        delays.append(delay)
+        entered.set()
+        time.sleep(delay)
+
+    client = LastFMClient(
+        "test-api-key",
+        transport=httpx.MockTransport(respond),
+        sleeper=sleep_for_retry,
+    )
+    return client, RecentTracksExtraction(client.get_scrobbles), delays
+
+
+def _assert_watermark_written_under_active_lease(
+    test_case: unittest.TestCase,
+    store: CheckpointStore,
+    run: Callable[[], object],
+) -> None:
+    original_record = store.record_successful_to
+    active_at_write: list[bool] = []
+
+    def record_successful_to(
+        username: str,
+        to: int,
+        *,
+        lease: Lease | None = None,
+    ) -> None:
+        test_case.assertIsNotNone(lease)
+        if lease is None:
+            return
+        active_at_write.append(store.is_lease_active(lease))
+        original_record(username, to, lease=lease)
+
+    with patch.object(
+        store,
+        "record_successful_to",
+        side_effect=record_successful_to,
+    ):
+        run()
+
+    test_case.assertEqual(active_at_write, [True])
 
 
 class FakeExtraction:
@@ -124,6 +236,29 @@ class FakeLanding:
             raise RuntimeError("landing failed")
 
 
+class BlockingLanding(FakeLanding):
+    def __init__(
+        self,
+        entered: threading.Event,
+        unblock: threading.Event,
+    ) -> None:
+        super().__init__()
+        self._entered = entered
+        self._unblock = unblock
+
+    def land(
+        self,
+        username: str,
+        *,
+        window: RecentTracksWindow,
+        records: list[str],
+    ) -> None:
+        self._entered.set()
+        if not self._unblock.wait(timeout=3):
+            raise TimeoutError("test did not unblock landing")
+        super().land(username, window=window, records=records)
+
+
 class FailingChunkLanding(FakeLanding):
     def land(
         self,
@@ -138,6 +273,27 @@ class FailingChunkLanding(FakeLanding):
 
 
 class FullResyncRunCoordinatorTests(unittest.TestCase):
+    def test_successful_full_resync_records_watermark_under_active_lease(
+        self,
+    ) -> None:
+        end = 31_536_000  # 1971-01-01T00:00:00Z
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            coordinator = FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                FakeLanding(),
+                clock=lambda: end,
+            )
+
+            _assert_watermark_written_under_active_lease(
+                self,
+                store,
+                lambda: coordinator.run("alice", start=0, end=end),
+            )
+            self.assertEqual(store.get_last_successful_to("alice"), end)
+
     def test_full_resync_initializes_watermark_from_epoch(self) -> None:
         end = 1_609_459_200  # 2021-01-01T00:00:00Z
 
@@ -191,6 +347,10 @@ class FullResyncRunCoordinatorTests(unittest.TestCase):
                 store.get_last_successful_to("alice"),
                 watermark,
             )
+            available_lease = store.acquire_lease("alice", ttl_seconds=1)
+            self.assertIsNotNone(available_lease)
+            if available_lease is not None:
+                available_lease.release()
 
     def test_full_resync_with_non_epoch_start_keeps_uninitialized_watermark(
         self,
@@ -265,6 +425,64 @@ class FullResyncRunCoordinatorTests(unittest.TestCase):
                 self.assertIsNotNone(store.get_last_full_resync_at("alice"))
 
             self.assertEqual(clock[0], 1800)
+
+    def test_full_resync_lease_is_renewed_during_slow_landing(self) -> None:
+        ttl_seconds = 0.06
+        end = 31_536_000  # 1971-01-01T00:00:00Z
+        entered = threading.Event()
+        unblock = threading.Event()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            coordinator = FullResyncRunCoordinator(
+                store,
+                FakeExtraction(),
+                BlockingLanding(entered, unblock),
+                clock=lambda: end,
+                lease_ttl_seconds=ttl_seconds,
+            )
+
+            _assert_lease_held_while_blocked(
+                self,
+                store,
+                entered,
+                unblock,
+                lambda: coordinator.run("alice", start=0, end=end),
+                ttl_seconds=ttl_seconds,
+            )
+
+            self.assertEqual(store.get_last_successful_to("alice"), end)
+
+    def test_full_resync_lease_is_renewed_during_api_retry_delay(self) -> None:
+        ttl_seconds = 0.06
+        end = 31_536_000  # 1971-01-01T00:00:00Z
+        entered = threading.Event()
+        client, extraction, delays = _retrying_extraction(entered)
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store = CheckpointStore(Path(directory))
+                coordinator = FullResyncRunCoordinator(
+                    store,
+                    extraction,
+                    FakeLanding(),
+                    clock=lambda: end,
+                    lease_ttl_seconds=ttl_seconds,
+                )
+
+                _assert_lease_held_while_blocked(
+                    self,
+                    store,
+                    entered,
+                    threading.Event(),
+                    lambda: coordinator.run("alice", start=0, end=end),
+                    ttl_seconds=ttl_seconds,
+                )
+
+                self.assertEqual(store.get_last_successful_to("alice"), end)
+                self.assertGreater(delays[0], ttl_seconds)
+        finally:
+            client.close()
 
     def test_calendar_year_chunks_are_contiguous_for_extraction_and_landing(
         self,
@@ -373,6 +591,8 @@ class FullResyncRunCoordinatorTests(unittest.TestCase):
     def test_full_resync_releases_lease_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CheckpointStore(Path(directory))
+            watermark = 1_672_531_200  # 2023-01-01T00:00:00Z
+            store.record_successful_to("alice", watermark)
             landing = FakeLanding(fail=True)
             coordinator = FullResyncRunCoordinator(
                 store,
@@ -388,7 +608,11 @@ class FullResyncRunCoordinatorTests(unittest.TestCase):
                     end=1_609_459_200,
                 )
 
-            self.assertIsNotNone(store.acquire_lease("alice", ttl_seconds=1))
+            self.assertEqual(store.get_last_successful_to("alice"), watermark)
+            available_lease = store.acquire_lease("alice", ttl_seconds=1)
+            self.assertIsNotNone(available_lease)
+            if available_lease is not None:
+                available_lease.release()
 
     def test_resume_matches_closed_chunks_when_run_end_changes(self) -> None:
         start = 1_514_764_800  # 2018-01-01T00:00:00Z
@@ -609,6 +833,155 @@ class ExpiringExtraction(FakeExtraction):
 
 
 class IncrementalRunCoordinatorTests(unittest.TestCase):
+    def test_successful_incremental_run_records_watermark_under_active_lease(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            coordinator = IncrementalRunCoordinator(
+                store,
+                FakeExtraction(),
+                FakeLanding(),
+                overlap_days=7,
+                clock=lambda: RUN_START,
+            )
+
+            _assert_watermark_written_under_active_lease(
+                self,
+                store,
+                lambda: coordinator.run("alice"),
+            )
+            self.assertEqual(store.get_last_successful_to("alice"), RUN_START)
+
+    def test_renewal_failure_while_landing_preserves_checkpoint_and_releases_lease(
+        self,
+    ) -> None:
+        ttl_seconds = 0.3
+        entered = threading.Event()
+        unblock = threading.Event()
+        renewal_failed = threading.Event()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            store.record_successful_to("alice", WATERMARK)
+            original_renew = store.renew_lease
+            coordinator_thread_id: int | None = None
+
+            def fail_background_renewal(
+                lease: Lease,
+                ttl: float = 300,
+            ) -> Lease | None:
+                if threading.get_ident() != coordinator_thread_id:
+                    renewal_failed.set()
+                    raise OSError("renewal failed")
+                return original_renew(lease, ttl)
+
+            coordinator = IncrementalRunCoordinator(
+                store,
+                FakeExtraction(),
+                BlockingLanding(entered, unblock),
+                overlap_days=7,
+                clock=lambda: RUN_START,
+                lease_ttl_seconds=ttl_seconds,
+            )
+            errors: list[BaseException] = []
+
+            def execute() -> None:
+                nonlocal coordinator_thread_id
+                coordinator_thread_id = threading.get_ident()
+                try:
+                    coordinator.run("alice")
+                except BaseException as error:
+                    errors.append(error)
+
+            with patch.object(
+                store,
+                "renew_lease",
+                side_effect=fail_background_renewal,
+            ):
+                thread = threading.Thread(target=execute)
+                thread.start()
+                try:
+                    self.assertTrue(entered.wait(timeout=2))
+                    self.assertTrue(renewal_failed.wait(timeout=2))
+                finally:
+                    unblock.set()
+                    thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive(), "coordinator did not finish")
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], OSError)
+            self.assertEqual(str(errors[0]), "renewal failed")
+            self.assertEqual(store.get_last_successful_to("alice"), WATERMARK)
+            available_lease = store.acquire_lease(
+                "alice",
+                ttl_seconds=ttl_seconds,
+            )
+            self.assertIsNotNone(available_lease)
+            if available_lease is not None:
+                available_lease.release()
+
+    def test_incremental_lease_is_renewed_during_slow_landing(self) -> None:
+        ttl_seconds = 0.06
+        entered = threading.Event()
+        unblock = threading.Event()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(Path(directory))
+            coordinator = IncrementalRunCoordinator(
+                store,
+                FakeExtraction(),
+                BlockingLanding(entered, unblock),
+                overlap_days=7,
+                clock=lambda: RUN_START,
+                lease_ttl_seconds=ttl_seconds,
+            )
+
+            _assert_lease_held_while_blocked(
+                self,
+                store,
+                entered,
+                unblock,
+                lambda: coordinator.run("alice"),
+                ttl_seconds=ttl_seconds,
+            )
+
+            self.assertEqual(store.get_last_successful_to("alice"), RUN_START)
+
+    def test_incremental_lease_is_renewed_during_api_retry_delay(self) -> None:
+        ttl_seconds = 0.06
+        entered = threading.Event()
+        client, extraction, delays = _retrying_extraction(entered)
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store = CheckpointStore(Path(directory))
+                coordinator = IncrementalRunCoordinator(
+                    store,
+                    extraction,
+                    FakeLanding(),
+                    overlap_days=7,
+                    clock=lambda: RUN_START,
+                    lease_ttl_seconds=ttl_seconds,
+                )
+
+                _assert_lease_held_while_blocked(
+                    self,
+                    store,
+                    entered,
+                    threading.Event(),
+                    lambda: coordinator.run("alice"),
+                    ttl_seconds=ttl_seconds,
+                )
+
+                self.assertEqual(
+                    store.get_last_successful_to("alice"),
+                    RUN_START,
+                )
+                self.assertGreater(delays[0], ttl_seconds)
+        finally:
+            client.close()
+
     def test_renews_lease_after_each_page_for_a_long_run(self) -> None:
         clock = [0.0]
         with tempfile.TemporaryDirectory() as directory:
@@ -884,6 +1257,10 @@ class IncrementalRunCoordinatorTests(unittest.TestCase):
             self.assertEqual(store.get_last_successful_to("alice"), WATERMARK)
             self.assertEqual(store.acquired, ["alice"])
             self.assertEqual(store.released, ["alice"])
+            available_lease = store.acquire_lease("alice", ttl_seconds=1)
+            self.assertIsNotNone(available_lease)
+            if available_lease is not None:
+                available_lease.release()
 
     def test_expired_lease_stops_before_landing_and_checkpoint_advancement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
