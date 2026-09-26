@@ -75,3 +75,12 @@ for the pipeline.
 Don't clear a `needs-review` label yourself unless you're the human
 actually approving that stage — it's the pipeline's only gate.
 <!-- ci-fix-loop-pipeline:end -->
+
+<!-- ci-fix-loop-agent-context-index:begin -->
+## Repository-specific context
+
+Before planning or implementing, read `docs/agent-context.md` for durable,
+verified facts about this repository. Add a fact only when work confirms it
+is reusable beyond the current task; keep task history, hypotheses, and
+temporary state in their existing issue or pipeline-memory records.
+<!-- ci-fix-loop-agent-context-index:end -->
