@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,77 @@ class OperationsDocumentationTests(unittest.TestCase):
 
     def read_doc(self, name: str) -> str:
         return (self.project_root / "docs" / name).read_text(encoding="utf-8")
+
+    def test_agent_context_structure_and_citations(self) -> None:
+        context = self.read_doc("agent-context.md")
+        test_command = (self.project_root / ".pipeline-test-command").read_text(
+            encoding="utf-8"
+        ).strip()
+        expected_headings = [
+            "# Repository-specific agent context",
+            "## Domain invariants",
+            "## Architecture and integration points",
+            "## Verification and tooling",
+            "## Operational workflows",
+        ]
+        headings = [
+            line for line in context.splitlines() if line.startswith("#")
+        ]
+        self.assertEqual(headings, expected_headings)
+
+        sections = {heading: [] for heading in expected_headings[1:]}
+        current_section = None
+        for line in context.splitlines():
+            if line in sections:
+                current_section = line
+            elif current_section is not None and line.startswith("- "):
+                sections[current_section].append(line)
+
+        for heading, bullets in sections.items():
+            with self.subTest(section=heading):
+                self.assertGreaterEqual(len(bullets), 3)
+                self.assertLessEqual(len(bullets), 10)
+                for bullet in bullets:
+                    citations = re.findall(r"`([^`]+)`", bullet)
+                    cited_paths = [
+                        citation
+                        for citation in citations
+                        if citation != test_command
+                    ]
+                    self.assertTrue(cited_paths, bullet)
+                    self.assertLessEqual(len(bullet), 300)
+                    without_paths = re.sub(r"`[^`]+`", "", bullet)
+                    self.assertEqual(
+                        len(re.findall(r"[.!?](?=\s|$)", without_paths)),
+                        1,
+                        bullet,
+                    )
+
+        cited_paths = [
+            citation
+            for citation in re.findall(r"`([^`]+)`", context)
+            if citation != test_command
+        ]
+        self.assertTrue(cited_paths)
+        for cited_path in cited_paths:
+            with self.subTest(path=cited_path):
+                self.assertTrue(
+                    (self.project_root / cited_path).exists(),
+                    f"cited repository path does not exist: {cited_path}",
+                )
+
+        verification_bullets = "\n".join(
+            sections["## Verification and tooling"]
+        )
+        self.assertTrue(test_command)
+        self.assertIn(test_command, verification_bullets)
+
+        self.assertNotRegex(context, re.compile(r"(?i)(password|secret|token)"))
+        self.assertNotRegex(
+            context,
+            re.compile(r"(?i)\bhttps?://[^/\s:@]+:[^/\s@]+@"),
+        )
+        self.assertNotRegex(context, re.compile(r"(?m)#\s*\d+"))
 
     def test_installation_guide_documents_package_variants_and_secret_boundaries(
         self,
