@@ -1490,6 +1490,16 @@ timezone = "UTC"
                 "AccountKey=fixture-azure-account-key",
                 ("fixture-azure-account-key",),
             ),
+            (
+                "AZURE_STORAGE_ACCOUNT_KEY",
+                "fixture-azure-storage-account-key",
+                (),
+            ),
+            (
+                "AZURE_STORAGE_CLIENT_SECRET",
+                "fixture-azure-storage-client-secret",
+                (),
+            ),
         )
         for environment_name, secret, additional_secrets in cases:
             with self.subTest(environment_name=environment_name):
@@ -1498,6 +1508,12 @@ timezone = "UTC"
                     "destination initialization failed: safe diagnostic "
                     f"({secret}) {' '.join(additional_secrets)}"
                 )
+
+                def fail_destination_initialization(
+                    _: RunRequest,
+                ) -> object:
+                    raise RuntimeError(exception_message)
+
                 result = main(
                     ["--config", str(path), "--user", "alice"],
                     environ={
@@ -1506,11 +1522,7 @@ timezone = "UTC"
                     },
                     output=output,
                     transport_factory=lambda _: FixtureExtraction(),
-                    destination_writer_factory=Mock(
-                        side_effect=RuntimeError(
-                            exception_message
-                        )
-                    ),
+                    destination_writer_factory=fail_destination_initialization,
                     clock=iter_clock(100, 101),
                 )
 
@@ -1519,10 +1531,77 @@ timezone = "UTC"
                 self.assertNotEqual(result, 0)
                 for credential in (secret, *additional_secrets):
                     self.assertNotIn(credential, summary)
+                self.assertIn("[REDACTED]", summary)
                 self.assertEqual(record["outcome"], "failed")
                 self.assertEqual(record["error"]["type"], "RuntimeError")
                 self.assertIn(
                     "destination initialization failed: safe diagnostic",
+                    record["error"]["message"],
+                )
+
+    def test_user_landing_failure_redacts_cloud_credential_environment_values(
+        self,
+    ) -> None:
+        path = self.write_config(self.valid_config())
+        cases = (
+            (
+                "AZURE_STORAGE_ACCOUNT_KEY",
+                "fixture-azure-storage-account-key",
+            ),
+            (
+                "AZURE_STORAGE_CLIENT_SECRET",
+                "fixture-azure-storage-client-secret",
+            ),
+        )
+
+        class FailingDestination:
+            def __init__(self, secret: str) -> None:
+                self.secret = secret
+
+            def land(
+                self,
+                username: str,
+                *,
+                window: RecentTracksWindow,
+                records: list[str],
+            ) -> None:
+                raise RuntimeError(
+                    f"cloud write failed: safe diagnostic ({self.secret})"
+                )
+
+        for environment_name, secret in cases:
+            with self.subTest(environment_name=environment_name):
+                output = io.StringIO()
+                with tempfile.TemporaryDirectory() as directory:
+                    result = main(
+                        [
+                            "--config",
+                            str(path),
+                            "--user",
+                            "alice",
+                            "--state-dir",
+                            directory,
+                        ],
+                        environ={
+                            "LASTFM_TEST_API_KEY": "fixture-api-key",
+                            environment_name: secret,
+                        },
+                        output=output,
+                        transport_factory=lambda _: FixtureExtraction(),
+                        destination_writer_factory=lambda _: FailingDestination(
+                            secret
+                        ),
+                    )
+
+                summary = output.getvalue()
+                record = json.loads(summary)
+                self.assertNotEqual(result, 0)
+                self.assertNotIn(secret, summary)
+                self.assertIn("[REDACTED]", summary)
+                self.assertEqual(record["outcome"], "failed")
+                self.assertEqual(record["error"]["type"], "RuntimeError")
+                self.assertIn(
+                    "cloud write failed: safe diagnostic",
                     record["error"]["message"],
                 )
 
